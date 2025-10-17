@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::config::{Config, Workflow};
 use anyhow::{Context, Result, anyhow};
 use time::OffsetDateTime;
 
@@ -44,12 +45,16 @@ pub struct WorkerSnapshot {
     pub branch: String,
     pub status: WorkerStatus,
     pub last_event: String,
+    pub workflow: String,
+    pub total_steps: usize,
+    pub current_step: Option<String>,
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct CreateWorkerRequest {
     pub issue: Option<String>,
     pub agent: Option<String>,
+    pub workflow: Option<String>,
 }
 
 pub enum WorkerCommand {
@@ -103,10 +108,13 @@ impl WorkerHandle {
 
 pub type WorkerEventReceiver = Receiver<WorkerEvent>;
 
-pub fn spawn_worker_system(repo_root: PathBuf) -> Result<(WorkerHandle, WorkerEventReceiver)> {
+pub fn spawn_worker_system(
+    repo_root: PathBuf,
+    config: Config,
+) -> Result<(WorkerHandle, WorkerEventReceiver)> {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = mpsc::channel();
-    let manager = WorkerManager::new(repo_root, cmd_rx, evt_tx.clone());
+    let manager = WorkerManager::new(repo_root, config, cmd_rx, evt_tx.clone());
 
     thread::Builder::new()
         .name("gensui-worker-manager".into())
@@ -118,6 +126,7 @@ pub fn spawn_worker_system(repo_root: PathBuf) -> Result<(WorkerHandle, WorkerEv
 
 struct WorkerManager {
     repo_root: PathBuf,
+    config: Config,
     cmd_rx: Receiver<WorkerCommand>,
     evt_tx: Sender<WorkerEvent>,
     next_id: usize,
@@ -127,11 +136,13 @@ struct WorkerManager {
 impl WorkerManager {
     fn new(
         repo_root: PathBuf,
+        config: Config,
         cmd_rx: Receiver<WorkerCommand>,
         evt_tx: Sender<WorkerEvent>,
     ) -> Self {
         Self {
             repo_root,
+            config,
             cmd_rx,
             evt_tx,
             next_id: 1,
@@ -213,10 +224,18 @@ impl WorkerManager {
             ));
         }
 
+        let workflow = request
+            .workflow
+            .as_deref()
+            .and_then(|name| self.config.workflow_by_name(name))
+            .cloned()
+            .unwrap_or_else(|| self.config.default_workflow().clone());
+
         let agent = request
             .agent
             .unwrap_or_else(|| "Claude Code (simulated)".to_string());
         let issue = request.issue;
+        let total_steps = workflow.steps().len();
 
         let snapshot = WorkerSnapshot {
             id: worker_id,
@@ -227,9 +246,12 @@ impl WorkerManager {
             branch: branch.clone(),
             status: WorkerStatus::Running,
             last_event: "Worktree provisioned".into(),
+            workflow: workflow.name.clone(),
+            total_steps,
+            current_step: None,
         };
 
-        let runtime = WorkerRuntime::new(snapshot, worktree_path, branch);
+        let runtime = WorkerRuntime::new(snapshot, worktree_path, branch, workflow);
         let mut runtime = match runtime {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -243,6 +265,18 @@ impl WorkerManager {
 
         let snapshot_for_event = runtime.snapshot();
         let _ = self.evt_tx.send(WorkerEvent::Created(snapshot_for_event));
+
+        if let Some(requested) = request.workflow.as_ref() {
+            if requested != &runtime.workflow.name {
+                let _ = self.evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: format!(
+                        "Requested workflow '{}' not found. Using '{}' instead",
+                        requested, runtime.workflow.name
+                    ),
+                });
+            }
+        }
 
         runtime.start_agent(&self.evt_tx);
         self.workers.insert(worker_id, runtime);
@@ -331,6 +365,7 @@ impl WorkerManager {
             let mut snapshot = runtime.state.lock().expect("worker snapshot poisoned");
             snapshot.status = WorkerStatus::Running;
             snapshot.last_event = "Restart requested".into();
+            snapshot.current_step = None;
             let _ = self.evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
         }
 
@@ -352,16 +387,23 @@ struct WorkerRuntime {
     handle: Option<thread::JoinHandle<()>>,
     worktree_path: PathBuf,
     branch: String,
+    workflow: Workflow,
 }
 
 impl WorkerRuntime {
-    fn new(snapshot: WorkerSnapshot, worktree_path: PathBuf, branch: String) -> Result<Self> {
+    fn new(
+        snapshot: WorkerSnapshot,
+        worktree_path: PathBuf,
+        branch: String,
+        workflow: Workflow,
+    ) -> Result<Self> {
         Ok(Self {
             state: Arc::new(Mutex::new(snapshot)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             worktree_path,
             branch,
+            workflow,
         })
     }
 
@@ -377,10 +419,11 @@ impl WorkerRuntime {
         self.cancel_flag = Arc::clone(&cancel);
         let evt_tx = evt_tx.clone();
         let worktree_path = self.worktree_path.clone();
+        let workflow = self.workflow.clone();
 
         let handle = thread::Builder::new()
             .name(format!("gensui-agent-{}", self.snapshot().name))
-            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx))
+            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow))
             .expect("failed to spawn agent simulation");
 
         self.handle = Some(handle);
@@ -399,6 +442,7 @@ fn agent_simulation(
     cancel: Arc<AtomicBool>,
     worktree_path: PathBuf,
     evt_tx: Sender<WorkerEvent>,
+    workflow: Workflow,
 ) {
     let worker_id = {
         state
@@ -407,43 +451,63 @@ fn agent_simulation(
             .unwrap_or(WorkerId(0))
     };
 
-    {
+    let total_steps = workflow.steps().len();
+
+    if total_steps == 0 {
         if let Ok(mut snapshot) = state.lock() {
-            snapshot.status = WorkerStatus::Running;
-            snapshot.last_event = "Agent booting".into();
+            snapshot.status = WorkerStatus::Idle;
+            snapshot.last_event = "No workflow steps defined".into();
+            snapshot.current_step = None;
             let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
         }
+        return;
+    }
+
+    if let Ok(mut snapshot) = state.lock() {
+        snapshot.status = WorkerStatus::Running;
+        snapshot.last_event = format!("ワークフロー '{}' を開始", workflow.name);
+        snapshot.current_step = None;
+        let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
     }
 
     if cancel.load(Ordering::SeqCst) {
         return;
     }
 
-    let steps = vec![
-        ("git status --short", "Inspecting git status"),
-        ("ls", "Listing worktree contents"),
-        (
-            "echo 'Simulated agent execution complete.'",
-            "Finishing agent run",
-        ),
-    ];
-
-    for (command, description) in steps {
+    for (idx, step) in workflow.steps().iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             if let Ok(mut snapshot) = state.lock() {
                 snapshot.status = WorkerStatus::Paused;
-                snapshot.last_event = "Agent cancelled".into();
+                snapshot.last_event = "ワーカーがキャンセルされました".into();
+                snapshot.current_step = None;
                 let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
             }
             return;
         }
 
+        let step_desc = step
+            .description
+            .clone()
+            .unwrap_or_else(|| "ステップを実行".to_string());
+
+        if let Ok(mut snapshot) = state.lock() {
+            snapshot.status = WorkerStatus::Running;
+            snapshot.current_step = Some(format!("{}/{}: {}", idx + 1, total_steps, step.name));
+            snapshot.last_event = step_desc.clone();
+            let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+        }
+
         let _ = evt_tx.send(WorkerEvent::Log {
             id: worker_id,
-            line: format!("{description}..."),
+            line: format!("[{}] {}", step.name, step_desc),
         });
 
-        match run_shell_command(command, &worktree_path) {
+        let _ = evt_tx.send(WorkerEvent::Log {
+            id: worker_id,
+            line: format!("$ {}", step.command),
+        });
+
+        match run_shell_command(&step.command, &worktree_path) {
             Ok(lines) => {
                 for line in lines {
                     let _ = evt_tx.send(WorkerEvent::Log {
@@ -456,6 +520,8 @@ fn agent_simulation(
                 if let Ok(mut snapshot) = state.lock() {
                     snapshot.status = WorkerStatus::Failed;
                     snapshot.last_event = format!("Command failed: {err}");
+                    snapshot.current_step =
+                        Some(format!("{}/{}: {}", idx + 1, total_steps, step.name));
                     let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
                 }
                 let _ = evt_tx.send(WorkerEvent::Error {
@@ -471,9 +537,15 @@ fn agent_simulation(
 
     if let Ok(mut snapshot) = state.lock() {
         snapshot.status = WorkerStatus::Idle;
-        snapshot.last_event = "Agent idle after run".into();
+        snapshot.last_event = format!("ワークフロー '{}' が完了", workflow.name);
+        snapshot.current_step = None;
         let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
     }
+
+    let _ = evt_tx.send(WorkerEvent::Log {
+        id: worker_id,
+        line: format!("Workflow '{}' completed", workflow.name),
+    });
 }
 
 fn run_shell_command(command: &str, dir: &Path) -> Result<Vec<String>> {

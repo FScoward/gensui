@@ -1,3 +1,4 @@
+mod config;
 mod worker;
 
 use std::collections::VecDeque;
@@ -14,6 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
+use crate::config::{Config, Workflow};
 use worker::{
     CreateWorkerRequest, WorkerEvent, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
     WorkerStatus, spawn_worker_system,
@@ -59,6 +61,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                         KeyCode::Char('r') => app.enqueue_restart_worker(),
                         KeyCode::Char('h') => app.toggle_help(),
                         KeyCode::Char('l') => app.toggle_logs(),
+                        KeyCode::Char('w') => app.cycle_workflow(),
                         KeyCode::Char('a') => app.cycle_filter(),
                         KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
                         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
@@ -85,6 +88,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 struct App {
     manager: WorkerHandle,
     event_rx: WorkerEventReceiver,
+    workflows: Vec<Workflow>,
+    selected_workflow_idx: usize,
     workers: Vec<WorkerView>,
     selected: usize,
     show_help: bool,
@@ -96,11 +101,33 @@ struct App {
 impl App {
     fn new() -> Result<Self> {
         let repo_root = std::env::current_dir().context("failed to determine repository root")?;
-        let (manager, event_rx) = spawn_worker_system(repo_root)?;
+        let config_path = repo_root.join("workflows.json");
+        let loaded = Config::load(&config_path).context("failed to load workflow configuration")?;
+        let config = if loaded.workflows.is_empty() {
+            Config::default()
+        } else {
+            loaded
+        };
+
+        let workflows = config.workflows.clone();
+        let default_idx = config
+            .default_workflow
+            .as_ref()
+            .and_then(|name| workflows.iter().position(|wf| &wf.name == name))
+            .unwrap_or(0);
+        let selected_workflow_idx = if workflows.is_empty() {
+            0
+        } else {
+            default_idx.min(workflows.len() - 1)
+        };
+
+        let (manager, event_rx) = spawn_worker_system(repo_root, config)?;
 
         Ok(Self {
             manager,
             event_rx,
+            workflows,
+            selected_workflow_idx,
             workers: Vec::new(),
             selected: 0,
             show_help: false,
@@ -111,7 +138,13 @@ impl App {
     }
 
     fn enqueue_create_worker(&mut self) {
-        if let Err(err) = self.manager.create_worker(CreateWorkerRequest::default()) {
+        let mut request = CreateWorkerRequest::default();
+        request.workflow = self
+            .workflows
+            .get(self.selected_workflow_idx)
+            .map(|wf| wf.name.clone());
+
+        if let Err(err) = self.manager.create_worker(request) {
             self.push_log(format!("ワーカー作成に失敗しました: {err}"));
         }
     }
@@ -160,6 +193,23 @@ impl App {
         self.clamp_selection();
     }
 
+    fn cycle_workflow(&mut self) {
+        if self.workflows.is_empty() {
+            return;
+        }
+        self.selected_workflow_idx = (self.selected_workflow_idx + 1) % self.workflows.len();
+        let name = self.current_workflow_name().to_string();
+        let desc = self
+            .workflows
+            .get(self.selected_workflow_idx)
+            .and_then(|wf| wf.description.as_deref())
+            .unwrap_or("説明なし");
+        self.push_log(format!(
+            "使用するワークフローを '{}' に切り替えました ({})",
+            name, desc
+        ));
+    }
+
     fn select_next(&mut self) {
         let count = self.visible_indices().len();
         if count == 0 {
@@ -198,7 +248,10 @@ impl App {
             match event {
                 WorkerEvent::Created(snapshot) => {
                     self.add_or_update_worker(snapshot.clone());
-                    self.push_log(format!("{} をプロビジョニングしました", snapshot.name));
+                    self.push_log(format!(
+                        "{} をプロビジョニングしました (workflow: {}, steps: {})",
+                        snapshot.name, snapshot.workflow, snapshot.total_steps
+                    ));
                 }
                 WorkerEvent::Updated(snapshot) => {
                     self.add_or_update_worker(snapshot.clone());
@@ -259,7 +312,12 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" – multi-worker dashboard  "),
-            Span::raw(format!("Workers: {}  Filter: {}", total, filter_label)),
+            Span::raw(format!(
+                "Workers: {}  Filter: {}  Workflow: {}",
+                total,
+                filter_label,
+                self.current_workflow_name()
+            )),
         ]);
 
         let header =
@@ -285,6 +343,14 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| "Unassigned".into()),
                 ),
+                Cell::from(worker.snapshot.workflow.clone()),
+                Cell::from(worker.snapshot.current_step.clone().unwrap_or_else(|| {
+                    if worker.snapshot.total_steps > 0 {
+                        format!("0/{} steps", worker.snapshot.total_steps)
+                    } else {
+                        "-".into()
+                    }
+                })),
                 Cell::from(worker.snapshot.agent.clone()),
                 Cell::from(worker.snapshot.worktree.clone()),
                 Cell::from(worker.snapshot.branch.clone()),
@@ -297,6 +363,8 @@ impl App {
         let header = Row::new(vec![
             Cell::from("NAME"),
             Cell::from("ISSUE"),
+            Cell::from("WORKFLOW"),
+            Cell::from("STEP"),
             Cell::from("AGENT"),
             Cell::from("WORKTREE"),
             Cell::from("BRANCH"),
@@ -308,11 +376,13 @@ impl App {
         let widths = [
             Constraint::Length(12),
             Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Length(18),
             Constraint::Length(20),
             Constraint::Length(24),
-            Constraint::Length(24),
+            Constraint::Length(20),
             Constraint::Length(10),
-            Constraint::Min(20),
+            Constraint::Min(24),
         ];
 
         let table = Table::new(rows, widths)
@@ -337,14 +407,22 @@ impl App {
                 Span::raw(" restart  "),
                 Span::styled("a", Style::default().fg(Color::Cyan)),
                 Span::raw(" filter  "),
+                Span::styled("w", Style::default().fg(Color::Cyan)),
+                Span::raw(" workflow  "),
                 Span::styled("h", Style::default().fg(Color::Cyan)),
                 Span::raw(" help  "),
                 Span::styled("l", Style::default().fg(Color::Cyan)),
                 Span::raw(" logs"),
             ]),
-            Line::from(vec![Span::raw(
-                "Shift+C: compact logs | 選択ワーカーのログは 'l' で確認",
-            )]),
+            Line::from(vec![
+                Span::raw(
+                    "Shift+C: compact logs | 選択ワーカーのログは 'l' で確認 | Active workflow: ",
+                ),
+                Span::styled(
+                    self.current_workflow_name(),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]),
         ];
 
         let footer =
@@ -376,6 +454,7 @@ impl App {
             Line::raw("d – ワーカー停止と worktree 削除"),
             Line::raw("r – ワーカーを再起動"),
             Line::raw("a – ステータスフィルタを切り替え"),
+            Line::raw("w – 使用するワークフローを切り替え"),
             Line::raw("j/k または ↑/↓ – 選択移動"),
             Line::raw("l – 選択ワーカーのログを表示"),
             Line::raw("h – このヘルプを表示"),
@@ -465,6 +544,13 @@ impl App {
             self.log_messages.pop_front();
         }
         self.log_messages.push_back(message);
+    }
+
+    fn current_workflow_name(&self) -> &str {
+        self.workflows
+            .get(self.selected_workflow_idx)
+            .map(|wf| wf.name.as_str())
+            .unwrap_or("n/a")
     }
 }
 

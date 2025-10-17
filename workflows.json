@@ -1,0 +1,26 @@
+{
+  "default_workflow": "default",
+  "workflows": [
+    {
+      "name": "default",
+      "description": "分析→実装→テストの標準フロー",
+      "steps": [
+        {
+          "name": "分析",
+          "description": "Issue内容の確認と影響範囲の同定",
+          "command": "echo '[分析] Issueを解析しています'"
+        },
+        {
+          "name": "実装",
+          "description": "コード変更の適用",
+          "command": "echo '[実装] 変更を適用中'"
+        },
+        {
+          "name": "テスト",
+          "description": "自動テストの実行",
+          "command": "echo '[テスト] テストを実行中'"
+        }
+      ]
+    }
+  ]
+}
