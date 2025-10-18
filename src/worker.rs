@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,14 +9,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{ClaudeStep, Config, Workflow};
+use crate::config::{ClaudeStep, Config, Workflow, WorkflowStep};
+use crate::state::{ManagerState, StateStore};
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerId(pub usize);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerStatus {
     Idle,
     Running,
@@ -34,9 +35,18 @@ impl WorkerStatus {
             WorkerStatus::Failed => "Failed",
         }
     }
+
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "Running" => WorkerStatus::Running,
+            "Paused" => WorkerStatus::Paused,
+            "Failed" => WorkerStatus::Failed,
+            _ => WorkerStatus::Idle,
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerSnapshot {
     pub id: WorkerId,
     pub name: String,
@@ -49,6 +59,8 @@ pub struct WorkerSnapshot {
     pub workflow: String,
     pub total_steps: usize,
     pub current_step: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -56,12 +68,14 @@ pub struct CreateWorkerRequest {
     pub issue: Option<String>,
     pub agent: Option<String>,
     pub workflow: Option<String>,
+    pub free_prompt: Option<String>,
 }
 
 pub enum WorkerCommand {
     Create(CreateWorkerRequest),
     Delete { id: WorkerId },
     Restart { id: WorkerId },
+    Continue { id: WorkerId, prompt: String },
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +119,12 @@ impl WorkerHandle {
             .send(WorkerCommand::Restart { id })
             .map_err(|err| anyhow!("failed to enqueue worker restart: {err}"))
     }
+
+    pub fn continue_worker(&self, id: WorkerId, prompt: String) -> Result<()> {
+        self.cmd_tx
+            .send(WorkerCommand::Continue { id, prompt })
+            .map_err(|err| anyhow!("failed to enqueue worker continuation: {err}"))
+    }
 }
 
 pub type WorkerEventReceiver = Receiver<WorkerEvent>;
@@ -115,7 +135,19 @@ pub fn spawn_worker_system(
 ) -> Result<(WorkerHandle, WorkerEventReceiver)> {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = mpsc::channel();
-    let manager = WorkerManager::new(repo_root, config, cmd_rx, evt_tx.clone());
+    let state_store = StateStore::new(repo_root.join(".gensui/state"))?;
+    let initial_state = state_store
+        .load_manager()?
+        .unwrap_or_else(|| ManagerState { next_id: 1 });
+    let next_id = initial_state.next_id.max(1);
+    let manager = WorkerManager::new(
+        repo_root,
+        config,
+        state_store,
+        cmd_rx,
+        evt_tx.clone(),
+        next_id,
+    );
 
     thread::Builder::new()
         .name("gensui-worker-manager".into())
@@ -128,6 +160,7 @@ pub fn spawn_worker_system(
 struct WorkerManager {
     repo_root: PathBuf,
     config: Config,
+    state_store: StateStore,
     cmd_rx: Receiver<WorkerCommand>,
     evt_tx: Sender<WorkerEvent>,
     next_id: usize,
@@ -138,15 +171,18 @@ impl WorkerManager {
     fn new(
         repo_root: PathBuf,
         config: Config,
+        state_store: StateStore,
         cmd_rx: Receiver<WorkerCommand>,
         evt_tx: Sender<WorkerEvent>,
+        next_id: usize,
     ) -> Self {
         Self {
             repo_root,
             config,
+            state_store,
             cmd_rx,
             evt_tx,
-            next_id: 1,
+            next_id,
             workers: HashMap::new(),
         }
     }
@@ -178,6 +214,14 @@ impl WorkerManager {
                         });
                     }
                 }
+                WorkerCommand::Continue { id, prompt } => {
+                    if let Err(err) = self.handle_continue(id, prompt) {
+                        let _ = self.evt_tx.send(WorkerEvent::Error {
+                            id: Some(id),
+                            message: err.to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -187,6 +231,7 @@ impl WorkerManager {
     fn handle_create(&mut self, request: CreateWorkerRequest) -> Result<()> {
         let worker_id = WorkerId(self.next_id);
         self.next_id += 1;
+        self.persist_manager_state();
 
         fs::create_dir_all(self.repo_root.join(".worktrees"))
             .context("failed to create .worktrees directory")?;
@@ -225,12 +270,31 @@ impl WorkerManager {
             ));
         }
 
-        let workflow = request
-            .workflow
-            .as_deref()
-            .and_then(|name| self.config.workflow_by_name(name))
-            .cloned()
-            .unwrap_or_else(|| self.config.default_workflow().clone());
+        let workflow = if let Some(prompt) = request.free_prompt.clone() {
+            Workflow {
+                name: format!("free-form-{}", worker_id.0),
+                description: Some("On-demand Claude execution".to_string()),
+                steps: vec![WorkflowStep {
+                    name: "Free Prompt".to_string(),
+                    command: None,
+                    claude: Some(ClaudeStep {
+                        prompt,
+                        model: None,
+                        allowed_tools: None,
+                        permission_mode: Some("plan".to_string()),
+                        extra_args: None,
+                    }),
+                    description: Some("User supplied prompt".to_string()),
+                }],
+            }
+        } else {
+            request
+                .workflow
+                .as_deref()
+                .and_then(|name| self.config.workflow_by_name(name))
+                .cloned()
+                .unwrap_or_else(|| self.config.default_workflow().clone())
+        };
 
         let agent = request
             .agent
@@ -250,6 +314,7 @@ impl WorkerManager {
             workflow: workflow.name.clone(),
             total_steps,
             current_step: None,
+            session_id: None,
         };
 
         let runtime = WorkerRuntime::new(snapshot, worktree_path, branch, workflow);
@@ -290,6 +355,8 @@ impl WorkerManager {
             .workers
             .remove(&id)
             .ok_or_else(|| anyhow!("worker {:?} not found", id))?;
+
+        let snapshot = runtime.snapshot();
 
         runtime.stop_agent();
 
@@ -351,6 +418,10 @@ impl WorkerManager {
             message: format!("Removed worktree {}", worktree_path.display()),
         });
 
+        if let Err(err) = self.state_store.delete_worker(&snapshot.name) {
+            eprintln!("Failed to delete worker state {}: {err}", snapshot.name);
+        }
+
         Ok(())
     }
 
@@ -375,9 +446,62 @@ impl WorkerManager {
         Ok(())
     }
 
+    fn handle_continue(&mut self, id: WorkerId, prompt: String) -> Result<()> {
+        let runtime = self
+            .workers
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("worker {:?} not found", id))?;
+
+        // Stop current agent execution
+        runtime.stop_agent();
+
+        // Create a new workflow step with the continuation prompt
+        let continue_step = WorkflowStep {
+            name: "Continue".to_string(),
+            command: None,
+            claude: Some(ClaudeStep {
+                prompt,
+                model: None,
+                allowed_tools: None,
+                permission_mode: Some("plan".to_string()),
+                extra_args: None,
+            }),
+            description: Some("User follow-up instruction".to_string()),
+        };
+
+        // Add the new step to the workflow
+        runtime.workflow.steps.push(continue_step);
+
+        {
+            let mut snapshot = runtime.state.lock().expect("worker snapshot poisoned");
+            snapshot.status = WorkerStatus::Running;
+            snapshot.last_event = "Continue with new instruction".into();
+            snapshot.total_steps = runtime.workflow.steps.len();
+            let _ = self.evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+        }
+
+        let _ = self.evt_tx.send(WorkerEvent::Log {
+            id,
+            line: "追加指示を受信しました".to_string(),
+        });
+
+        // Restart agent with updated workflow
+        runtime.start_agent(&self.evt_tx);
+
+        Ok(())
+    }
+
     fn shutdown_all(&mut self) {
         for (_, mut runtime) in self.workers.drain() {
             runtime.stop_agent();
+        }
+    }
+
+    fn persist_manager_state(&self) {
+        if let Err(err) = self.state_store.save_manager(&ManagerState {
+            next_id: self.next_id,
+        }) {
+            eprintln!("Failed to persist manager state: {err}");
         }
     }
 }
@@ -511,6 +635,7 @@ fn agent_simulation(
                 workflow: workflow.name.clone(),
                 total_steps,
                 current_step: Some(format!("{}/{}: {}", idx + 1, total_steps, step.name)),
+                session_id: None,
             }
         };
 
@@ -521,11 +646,58 @@ fn agent_simulation(
 
         let result = if let Some(claude_cfg) = &step.claude {
             let prompt = render_prompt(&claude_cfg.prompt, &snapshot_info);
+
+            // Show the actual prompt being sent
             let _ = evt_tx.send(WorkerEvent::Log {
                 id: worker_id,
-                line: format!("<Claude> prompt prepared ({} chars)", prompt.len()),
+                line: "─── Prompt ───".to_string(),
             });
-            run_claude_command(claude_cfg, &prompt, &worktree_path)
+            // Split prompt into lines and show each line
+            for line in prompt.lines().take(10) {
+                let _ = evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: format!("  {}", line),
+                });
+            }
+            if prompt.lines().count() > 10 {
+                let _ = evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: format!("  ... ({} more lines)", prompt.lines().count() - 10),
+                });
+            }
+            let _ = evt_tx.send(WorkerEvent::Log {
+                id: worker_id,
+                line: "─── Executing ───".to_string(),
+            });
+
+            // Log command details
+            let mut cmd_parts = vec!["claude", "--print", "--output-format", "stream-json", "--verbose"];
+            if let Some(model) = &claude_cfg.model {
+                cmd_parts.push("--model");
+                cmd_parts.push(model);
+            }
+            if let Some(mode) = &claude_cfg.permission_mode {
+                cmd_parts.push("--permission-mode");
+                cmd_parts.push(mode);
+            }
+            let _ = evt_tx.send(WorkerEvent::Log {
+                id: worker_id,
+                line: format!("<Claude> {}", cmd_parts.join(" ")),
+            });
+
+            // Pass current session_id to continue the session
+            let current_session_id = snapshot_info.session_id.as_deref();
+            run_claude_command(claude_cfg, &prompt, &worktree_path, current_session_id)
+                .map(|(lines, new_session_id)| {
+                    // Store the session_id back into the snapshot
+                    if let Some(sid) = new_session_id {
+                        if let Ok(mut snapshot) = state.lock() {
+                            snapshot.session_id = Some(sid);
+                            let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+                        }
+                    }
+                    lines
+                })
         } else if let Some(command) = &step.command {
             let _ = evt_tx.send(WorkerEvent::Log {
                 id: worker_id,
@@ -541,7 +713,7 @@ fn agent_simulation(
                 for line in lines {
                     let _ = evt_tx.send(WorkerEvent::Log {
                         id: worker_id,
-                        line: format!("$ {}", line),
+                        line,
                     });
                 }
             }
@@ -578,57 +750,67 @@ fn agent_simulation(
 }
 
 fn run_shell_command(command: &str, dir: &Path) -> Result<Vec<String>> {
-    let mut child = Command::new("bash")
+    let output = Command::new("bash")
         .arg("-lc")
         .arg(command)
         .current_dir(dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn shell command '{command}'"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture stderr"))?;
+        .output()
+        .with_context(|| format!("failed to execute shell command '{command}'"))?;
 
     let mut lines = Vec::new();
 
-    let mut read_pipe = |reader: &mut dyn BufRead| -> Result<()> {
-        for line in reader.lines() {
-            let line = line?;
-            if !line.trim().is_empty() {
-                lines.push(line);
-            }
+    // Process stdout
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    for line in stdout_str.lines() {
+        if !line.trim().is_empty() {
+            lines.push(line.to_string());
         }
-        Ok(())
-    };
+    }
 
-    let mut stdout_reader = BufReader::new(stdout);
-    read_pipe(&mut stdout_reader)?;
+    // Process stderr
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    for line in stderr_str.lines() {
+        if !line.trim().is_empty() {
+            lines.push(line.to_string());
+        }
+    }
 
-    let mut stderr_reader = BufReader::new(stderr);
-    read_pipe(&mut stderr_reader)?;
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(anyhow!("command '{command}' exited with status {status}"));
+    if !output.status.success() {
+        return Err(anyhow!("command '{command}' exited with status {}", output.status));
     }
 
     Ok(lines)
 }
 
-fn run_claude_command(step: &ClaudeStep, prompt: &str, dir: &Path) -> Result<Vec<String>> {
-    let binary = env::var("GENSUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
-    let mut cmd = Command::new(binary);
+fn run_claude_command(
+    step: &ClaudeStep,
+    prompt: &str,
+    dir: &Path,
+    session_id: Option<&str>,
+) -> Result<(Vec<String>, Option<String>)> {
+    let binary = env::var("GENSUI_CLAUDE_BIN").unwrap_or_else(|_| {
+        // Try to find claude in common locations
+        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let local_claude = format!("{}/.claude/local/claude", home);
+        if Path::new(&local_claude).exists() {
+            local_claude
+        } else {
+            "claude".to_string()
+        }
+    });
+    let mut cmd = Command::new(&binary);
 
     cmd.arg("--print").arg(prompt);
-    cmd.arg("--no-interactive");
     cmd.arg("--output-format").arg("stream-json");
+    cmd.arg("--verbose");
+
+    // Continue existing session if session_id is provided
+    if session_id.is_some() {
+        cmd.arg("--continue");
+    }
 
     if let Some(model) = &step.model {
         cmd.arg("--model").arg(model);
@@ -653,47 +835,156 @@ fn run_claude_command(step: &ClaudeStep, prompt: &str, dir: &Path) -> Result<Vec
         }
     }
 
-    cmd.current_dir(dir)
+    cmd.current_dir(dir);
+
+    let output = cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| "failed to spawn Claude Code process")?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture Claude stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture Claude stderr"))?;
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| "failed to execute Claude Code process")?;
 
     let mut lines = Vec::new();
+    let mut extracted_session_id: Option<String> = None;
 
-    let mut read_pipe = |reader: &mut dyn BufRead, label: &str| -> Result<()> {
-        for line in reader.lines() {
-            let line = line?;
-            if !line.trim().is_empty() {
-                lines.push(format!("{}: {}", label, line));
-            }
+    // Process stdout - parse JSON stream
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    for line in stdout_str.lines() {
+        if line.trim().is_empty() {
+            continue;
         }
-        Ok(())
-    };
 
-    let mut stdout_reader = BufReader::new(stdout);
-    read_pipe(&mut stdout_reader, "stdout")?;
+        // Try to parse as JSON
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            match json.get("type").and_then(|v| v.as_str()) {
+                Some("system") => {
+                    // Session initialization
+                    if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                        extracted_session_id = Some(sid.to_string());
+                        lines.push(format!("Session: {}", &sid[..8.min(sid.len())]));
+                    }
+                }
+                Some("assistant") => {
+                    // Extract text content from assistant message
+                    if let Some(message) = json.get("message") {
+                        if let Some(content_array) = message.get("content").and_then(|v| v.as_array()) {
+                            for content_item in content_array {
+                                match content_item.get("type").and_then(|v| v.as_str()) {
+                                    Some("text") => {
+                                        if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
+                                            // Check if this is an error message
+                                            if text.contains("API Error:") || text.contains("\"type\":\"error\"") {
+                                                lines.push("❌ Error encountered:".to_string());
+                                            }
+                                            // Split long text into multiple lines for readability
+                                            for text_line in text.lines() {
+                                                lines.push(text_line.to_string());
+                                            }
+                                        }
+                                    }
+                                    Some("tool_use") => {
+                                        if let Some(name) = content_item.get("name").and_then(|v| v.as_str()) {
+                                            lines.push(format!("🔧 Using tool: {}", name));
+                                        }
+                                    }
+                                    Some("thinking") => {
+                                        lines.push("💭 Thinking...".to_string());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("result") => {
+                    // Check for errors first
+                    if let Some(true) = json.get("is_error").and_then(|v| v.as_bool()) {
+                        lines.push("⚠️  Claude encountered an error".to_string());
+                    }
 
-    let mut stderr_reader = BufReader::new(stderr);
-    read_pipe(&mut stderr_reader, "stderr")?;
+                    // Final result
+                    if let Some(result_text) = json.get("result").and_then(|v| v.as_str()) {
+                        if !result_text.is_empty() {
+                            lines.push("─── Result ───".to_string());
+                            for result_line in result_text.lines() {
+                                lines.push(result_line.to_string());
+                            }
+                        }
+                    }
 
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(anyhow!("Claude CLI exited with status {status}"));
+                    // Show cost information if available
+                    if let Some(cost) = json.get("total_cost_usd").and_then(|v| v.as_f64()) {
+                        lines.push(format!("💰 Cost: ${:.4}", cost));
+                    }
+                }
+                Some("error") => {
+                    // API error response
+                    lines.push("❌ API Error:".to_string());
+                    if let Some(error_obj) = json.get("error") {
+                        if let Some(message) = error_obj.get("message").and_then(|v| v.as_str()) {
+                            lines.push(format!("  {}", message));
+                        }
+                        if let Some(error_type) = error_obj.get("type").and_then(|v| v.as_str()) {
+                            lines.push(format!("  Type: {}", error_type));
+                        }
+                    }
+                }
+                Some("tool_result") => {
+                    // Tool execution result - could show this for debugging
+                    lines.push("✓ Tool completed".to_string());
+                }
+                _ => {
+                    // Unknown type - log for debugging
+                    lines.push(format!("DEBUG: {}", line));
+                }
+            }
+        } else {
+            // Not JSON, treat as plain text
+            lines.push(line.to_string());
+        }
     }
 
-    Ok(lines)
+    // Process stderr
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    for line in stderr_str.lines() {
+        if !line.trim().is_empty() {
+            lines.push(format!("stderr: {}", line));
+        }
+    }
+
+    if !output.status.success() {
+        let stderr_lines: Vec<_> = lines.iter()
+            .filter(|l| l.starts_with("stderr:"))
+            .cloned()
+            .collect();
+        let other_lines: Vec<_> = lines.iter()
+            .filter(|l| !l.starts_with("stderr:"))
+            .cloned()
+            .collect();
+
+        let mut error_parts = vec![format!("Claude CLI exited with status {}", output.status)];
+
+        let has_other = !other_lines.is_empty();
+        let has_stderr = !stderr_lines.is_empty();
+
+        if has_other {
+            error_parts.push("Output:".to_string());
+            error_parts.extend(other_lines);
+        }
+
+        if has_stderr {
+            error_parts.push("Errors:".to_string());
+            error_parts.extend(stderr_lines);
+        }
+
+        if !has_other && !has_stderr {
+            error_parts.push("No output captured".to_string());
+        }
+
+        return Err(anyhow!("{}", error_parts.join("\n")));
+    }
+
+    Ok((lines, extracted_session_id))
 }
 
 fn render_prompt(template: &str, snapshot: &WorkerSnapshot) -> String {
