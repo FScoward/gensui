@@ -21,6 +21,27 @@
           "command": "echo '[テスト] テストを実行中'"
         }
       ]
+    },
+    {
+      "name": "claude-analyze",
+      "description": "Claude Codeに分析を任せるサンプル",
+      "steps": [
+        {
+          "name": "Claude分析",
+          "description": "Claude CodeにIssueの概要と影響範囲を整理させる",
+          "claude": {
+            "prompt": "Issue {{issue}} について、影響範囲と懸念点を3点以内でまとめてください。現在のブランチは {{branch}} です。",
+            "model": "sonnet",
+            "permission_mode": "plan",
+            "allowed_tools": [],
+            "extra_args": ["--max-output-tokens", "800"]
+          }
+        },
+        {
+          "name": "結果の確認",
+          "command": "echo '[確認] Claudeの出力をレビューしてください'"
+        }
+      ]
     }
   ]
 }

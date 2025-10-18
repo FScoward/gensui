@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{Config, Workflow};
+use crate::config::{ClaudeStep, Config, Workflow};
 use anyhow::{Context, Result, anyhow};
 use time::OffsetDateTime;
 
@@ -490,24 +491,52 @@ fn agent_simulation(
             .clone()
             .unwrap_or_else(|| "ステップを実行".to_string());
 
-        if let Ok(mut snapshot) = state.lock() {
+        let snapshot_info = if let Ok(mut snapshot) = state.lock() {
             snapshot.status = WorkerStatus::Running;
             snapshot.current_step = Some(format!("{}/{}: {}", idx + 1, total_steps, step.name));
             snapshot.last_event = step_desc.clone();
+            let cloned = snapshot.clone();
             let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
-        }
+            cloned
+        } else {
+            WorkerSnapshot {
+                id: worker_id,
+                name: "unknown".into(),
+                issue: None,
+                agent: "Claude".into(),
+                worktree: worktree_path.to_string_lossy().into_owned(),
+                branch: "".into(),
+                status: WorkerStatus::Running,
+                last_event: step_desc.clone(),
+                workflow: workflow.name.clone(),
+                total_steps,
+                current_step: Some(format!("{}/{}: {}", idx + 1, total_steps, step.name)),
+            }
+        };
 
         let _ = evt_tx.send(WorkerEvent::Log {
             id: worker_id,
             line: format!("[{}] {}", step.name, step_desc),
         });
 
-        let _ = evt_tx.send(WorkerEvent::Log {
-            id: worker_id,
-            line: format!("$ {}", step.command),
-        });
+        let result = if let Some(claude_cfg) = &step.claude {
+            let prompt = render_prompt(&claude_cfg.prompt, &snapshot_info);
+            let _ = evt_tx.send(WorkerEvent::Log {
+                id: worker_id,
+                line: format!("<Claude> prompt prepared ({} chars)", prompt.len()),
+            });
+            run_claude_command(claude_cfg, &prompt, &worktree_path)
+        } else if let Some(command) = &step.command {
+            let _ = evt_tx.send(WorkerEvent::Log {
+                id: worker_id,
+                line: format!("$ {}", command),
+            });
+            run_shell_command(command, &worktree_path)
+        } else {
+            Ok(vec!["(no-op step)".into()])
+        };
 
-        match run_shell_command(&step.command, &worktree_path) {
+        match result {
             Ok(lines) => {
                 for line in lines {
                     let _ = evt_tx.send(WorkerEvent::Log {
@@ -591,6 +620,91 @@ fn run_shell_command(command: &str, dir: &Path) -> Result<Vec<String>> {
     }
 
     Ok(lines)
+}
+
+fn run_claude_command(step: &ClaudeStep, prompt: &str, dir: &Path) -> Result<Vec<String>> {
+    let binary = env::var("GENSUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+    let mut cmd = Command::new(binary);
+
+    cmd.arg("--print").arg(prompt);
+    cmd.arg("--no-interactive");
+    cmd.arg("--output-format").arg("stream-json");
+
+    if let Some(model) = &step.model {
+        cmd.arg("--model").arg(model);
+    }
+
+    if let Some(mode) = &step.permission_mode {
+        cmd.arg("--permission-mode").arg(mode);
+    }
+
+    if let Some(tools) = &step.allowed_tools {
+        if !tools.is_empty() {
+            cmd.arg("--allowedTools").arg(tools.join(","));
+        }
+    }
+
+    if let Some(extra) = &step.extra_args {
+        for arg in extra {
+            let replaced = arg
+                .replace("{{prompt}}", prompt)
+                .replace("{{workdir}}", &dir.to_string_lossy());
+            cmd.arg(replaced);
+        }
+    }
+
+    cmd.current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| "failed to spawn Claude Code process")?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture Claude stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture Claude stderr"))?;
+
+    let mut lines = Vec::new();
+
+    let mut read_pipe = |reader: &mut dyn BufRead, label: &str| -> Result<()> {
+        for line in reader.lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                lines.push(format!("{}: {}", label, line));
+            }
+        }
+        Ok(())
+    };
+
+    let mut stdout_reader = BufReader::new(stdout);
+    read_pipe(&mut stdout_reader, "stdout")?;
+
+    let mut stderr_reader = BufReader::new(stderr);
+    read_pipe(&mut stderr_reader, "stderr")?;
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow!("Claude CLI exited with status {status}"));
+    }
+
+    Ok(lines)
+}
+
+fn render_prompt(template: &str, snapshot: &WorkerSnapshot) -> String {
+    template
+        .replace(
+            "{{issue}}",
+            snapshot.issue.as_deref().unwrap_or("(no issue)"),
+        )
+        .replace("{{worker}}", snapshot.name.as_str())
+        .replace("{{branch}}", snapshot.branch.as_str())
+        .replace("{{worktree}}", snapshot.worktree.as_str())
 }
 
 fn determine_base_ref(repo_root: &Path) -> Option<String> {

@@ -24,9 +24,25 @@ pub struct Workflow {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowStep {
     pub name: String,
-    pub command: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub claude: Option<ClaudeStep>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ClaudeStep {
+    pub prompt: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub extra_args: Option<Vec<String>>,
 }
 
 impl Config {
@@ -71,17 +87,20 @@ impl Default for Config {
                 steps: vec![
                     WorkflowStep {
                         name: "分析".to_string(),
-                        command: "echo 'Analyzing issue context'".to_string(),
+                        command: Some("echo 'Analyzing issue context'".to_string()),
+                        claude: None,
                         description: Some("Issue内容の分析を実施".to_string()),
                     },
                     WorkflowStep {
                         name: "実装".to_string(),
-                        command: "echo 'Implementing changes'".to_string(),
+                        command: Some("echo 'Implementing changes'".to_string()),
+                        claude: None,
                         description: Some("コード変更を適用".to_string()),
                     },
                     WorkflowStep {
                         name: "テスト".to_string(),
-                        command: "echo 'Running tests'".to_string(),
+                        command: Some("echo 'Running tests'".to_string()),
+                        claude: None,
                         description: Some("テストスイートを実行".to_string()),
                     },
                 ],

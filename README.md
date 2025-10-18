@@ -91,7 +91,7 @@ GensuiではHeadless CLI方式を標準とし、`command-group`でプロセス�
 ## 次のステップ
 - [x] Rust + `ratatui`でのプロトタイプ実装
 - [x] worktree管理ライブラリ/ラッパの整備
-- [ ] Claude Code Headless制御用モジュール作成
+- [x] Claude Code Headless制御用モジュール作成
 - [ ] 基本ワークフロー（分析→実装→テスト）をテンプレート化
 - [ ] 早期ユーザーフィードバックの収集と設計改善
 
@@ -142,6 +142,28 @@ cargo run
 ```
 
 ヘッダ／フッタに現在選択中のワークフロー名が表示され、`w`キーで順次切り替え可能です。ワーカー作成時には選択中のワークフローが適用され、各ステップのコマンド実行ログが`Logs`モーダルから確認できます。
+
+#### Claude Code連携
+
+ステップに`claude`ブロックを定義すると、Claude Code CLIをheadless実行します。CLIへのパスは環境変数`GENSUI_CLAUDE_BIN`（デフォルト: `claude`）で指定します。例:
+
+```json
+{
+  "name": "Claude分析",
+  "description": "Claude CodeにIssueの影響範囲をまとめさせる",
+  "claude": {
+    "prompt": "Issue {{issue}} について、影響範囲と懸念点を3点以内でまとめてください。",
+    "model": "sonnet",
+    "permission_mode": "plan",
+    "allowed_tools": [],
+    "extra_args": ["--max-output-tokens", "800"]
+  }
+}
+```
+
+テンプレートでは`{{issue}}`、`{{branch}}`、`{{worktree}}`、`{{worker}}`が利用できます。`extra_args`はCLI引数をそのまま追加し、`{{prompt}}`や`{{workdir}}`プレースホルダを埋め込みます。
+
+> ⚠️ Claude CLIのバージョンによりフラグ名が異なる場合があります。必要に応じて`extra_args`側でフル引数を指定してください。非ゼロ終了の場合はステップが`Failed`となり、stderr/stdoutをログに記録します。
 
 ### 今後の発展余地
 
