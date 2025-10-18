@@ -593,6 +593,12 @@ impl WorkerManager {
     }
 
     fn shutdown_all(&mut self) {
+        // Persist all workers before shutting down
+        for id in self.workers.keys().copied().collect::<Vec<_>>() {
+            self.persist_worker(id);
+        }
+
+        // Then stop all workers
         for (_, mut runtime) in self.workers.drain() {
             runtime.stop_agent();
         }
