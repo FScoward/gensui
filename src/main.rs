@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use crate::config::{Config, Workflow};
-use crate::state::{ActionLogEntry, StateStore, WorkerRecord, WorkerSnapshotData};
+use crate::state::{ActionLogEntry, StateStore};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use worker::{
     CreateWorkerRequest, WorkerEvent, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
@@ -117,12 +117,8 @@ impl App {
             default_idx.min(workflows.len() - 1)
         };
 
-        let persisted_workers = state_store.load_workers()?;
-        let mut workers = Vec::new();
-        for record in persisted_workers {
-            workers.push(WorkerView::from_record(record));
-        }
-
+        // Don't restore workers to UI - they are not running in WorkerManager
+        // Only restore action logs for history
         let mut log_messages = VecDeque::with_capacity(GLOBAL_LOG_CAPACITY);
         let history = state_store.load_action_log(GLOBAL_LOG_CAPACITY)?;
         for entry in history {
@@ -137,7 +133,7 @@ impl App {
             state_store,
             workflows,
             selected_workflow_idx,
-            workers,
+            workers: Vec::new(),
             selected: 0,
             show_help: false,
             show_logs: false,
@@ -281,6 +277,24 @@ impl App {
 
     fn enqueue_delete_worker(&mut self) {
         if let Some(id) = self.selected_worker_id() {
+            // Check if this is an archived worker
+            if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == id) {
+                if worker.snapshot.status == WorkerStatus::Archived {
+                    // For archived workers, just delete the state file
+                    if let Err(err) = self.state_store.delete_worker(&worker.snapshot.name) {
+                        self.push_log(format!("アーカイブ削除に失敗しました: {err}"));
+                    } else {
+                        // Remove from UI
+                        if let Some(pos) = self.workers.iter().position(|w| w.snapshot.id == id) {
+                            let worker = self.workers.remove(pos);
+                            self.push_log(format!("アーカイブを削除しました: {}", worker.snapshot.name));
+                            self.clamp_selection();
+                        }
+                    }
+                    return;
+                }
+            }
+
             if let Err(err) = self.manager.delete_worker(id) {
                 self.push_log(format!("ワーカー削除に失敗しました ({:?}): {err}", id));
             }
@@ -289,6 +303,14 @@ impl App {
 
     fn enqueue_restart_worker(&mut self) {
         if let Some(id) = self.selected_worker_id() {
+            // Check if this is an archived worker
+            if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == id) {
+                if worker.snapshot.status == WorkerStatus::Archived {
+                    self.push_log("アーカイブされたワーカーは再起動できません".to_string());
+                    return;
+                }
+            }
+
             if let Err(err) = self.manager.restart_worker(id) {
                 self.push_log(format!("ワーカー再起動に失敗しました ({:?}): {err}", id));
             }
@@ -347,7 +369,8 @@ impl App {
             Some(WorkerStatus::Running) => Some(WorkerStatus::Paused),
             Some(WorkerStatus::Paused) => Some(WorkerStatus::Failed),
             Some(WorkerStatus::Failed) => Some(WorkerStatus::Idle),
-            Some(WorkerStatus::Idle) => None,
+            Some(WorkerStatus::Idle) => Some(WorkerStatus::Archived),
+            Some(WorkerStatus::Archived) => None,
         };
         self.push_log("ステータスフィルタを更新しました".into());
         self.selected = 0;
@@ -396,6 +419,12 @@ impl App {
                 // Worker is selected - send continuation to existing worker
                 let worker_index = visible[self.selected];
                 if let Some(worker) = self.workers.get(worker_index) {
+                    // Check if archived
+                    if worker.snapshot.status == WorkerStatus::Archived {
+                        self.push_log("アーカイブされたワーカーには追加指示を送信できません".to_string());
+                        return;
+                    }
+
                     let worker_id = worker.snapshot.id;
                     match self.manager.continue_worker(worker_id, trimmed.to_string()) {
                         Ok(_) => {
@@ -761,9 +790,9 @@ impl App {
             Line::raw("MVP ショートカット"),
             Line::raw(""),
             Line::raw("c – ワーカーを作成（ワークフロー or 自由入力を選択）"),
-            Line::raw("d – ワーカー停止と worktree 削除"),
-            Line::raw("r – ワーカーを再起動"),
-            Line::raw("i – 自由指示を送信（ワーカー選択時は追加指示）"),
+            Line::raw("d – ワーカー停止と worktree 削除（アーカイブは状態削除のみ）"),
+            Line::raw("r – ワーカーを再起動（アーカイブは不可）"),
+            Line::raw("i – 自由指示を送信（ワーカー選択時は追加指示、アーカイブは不可）"),
             Line::raw("a – ステータスフィルタを切り替え"),
             Line::raw("w – 使用するワークフローを切り替え"),
             Line::raw("j/k または ↑/↓ – 選択移動 (ログ表示時はスクロール)"),
@@ -773,6 +802,8 @@ impl App {
             Line::raw("h – このヘルプを表示"),
             Line::raw("Shift+C – アクションログを圧縮"),
             Line::raw("q – 終了"),
+            Line::raw(""),
+            Line::raw("ステータス: Running/Idle/Paused/Failed/Archived(青=履歴)"),
         ]
     }
 
@@ -813,20 +844,6 @@ impl App {
         (title, visible_lines)
     }
 
-    fn log_lines_for_modal(&self) -> Vec<Line<'static>> {
-        if let Some(view) = self.selected_worker_view() {
-            if view.logs.is_empty() {
-                vec![Line::raw("このワーカーのログはまだありません。")]
-            } else {
-                view.logs.iter().cloned().map(Line::from).collect()
-            }
-        } else if self.log_messages.is_empty() {
-            vec![Line::raw("アクションログはまだありません。")]
-        } else {
-            self.log_messages.iter().cloned().map(Line::from).collect()
-        }
-    }
-
     fn add_or_update_worker(&mut self, snapshot: WorkerSnapshot) {
         if let Some(pos) = self
             .workers
@@ -835,19 +852,9 @@ impl App {
         {
             let view = &mut self.workers[pos];
             view.update_snapshot(snapshot);
-            let record = WorkerRecord {
-                snapshot: snapshot_to_data(&view.snapshot),
-                logs: view.logs.iter().cloned().collect(),
-            };
-            self.persist_worker_record(record);
         } else {
             let view = WorkerView::new(snapshot);
-            let record = WorkerRecord {
-                snapshot: snapshot_to_data(&view.snapshot),
-                logs: Vec::new(),
-            };
             self.workers.push(view);
-            self.persist_worker_record(record);
         }
         self.clamp_selection();
     }
@@ -869,11 +876,6 @@ impl App {
         if let Some(pos) = self.workers.iter().position(|view| view.snapshot.id == id) {
             let view = &mut self.workers[pos];
             view.push_log(line);
-            let record = WorkerRecord {
-                snapshot: snapshot_to_data(&view.snapshot),
-                logs: view.logs.iter().cloned().collect(),
-            };
-            self.persist_worker_record(record);
         }
     }
 
@@ -934,12 +936,6 @@ impl App {
         }
     }
 
-    fn persist_worker_record(&self, record: WorkerRecord) {
-        if let Err(err) = self.state_store.save_worker(&record) {
-            eprintln!("Failed to persist worker {}: {err}", record.snapshot.name);
-        }
-    }
-
     fn current_workflow_name(&self) -> &str {
         self.workflows
             .get(self.selected_workflow_idx)
@@ -961,18 +957,6 @@ impl WorkerView {
             snapshot,
             logs: VecDeque::with_capacity(Self::LOG_CAPACITY),
         }
-    }
-
-    fn from_record(record: WorkerRecord) -> Self {
-        let snapshot = snapshot_from_data(record.snapshot);
-        let mut view = Self::new(snapshot);
-        for line in record.logs {
-            if view.logs.len() >= Self::LOG_CAPACITY {
-                view.logs.pop_front();
-            }
-            view.logs.push_back(line);
-        }
-        view
     }
 
     fn update_snapshot(&mut self, snapshot: WorkerSnapshot) {
@@ -1018,40 +1002,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn snapshot_to_data(snapshot: &WorkerSnapshot) -> WorkerSnapshotData {
-    WorkerSnapshotData {
-        id: snapshot.id.0,
-        name: snapshot.name.clone(),
-        issue: snapshot.issue.clone(),
-        agent: snapshot.agent.clone(),
-        worktree: snapshot.worktree.clone(),
-        branch: snapshot.branch.clone(),
-        status: snapshot.status.label().to_string(),
-        last_event: snapshot.last_event.clone(),
-        workflow: snapshot.workflow.clone(),
-        total_steps: snapshot.total_steps,
-        current_step: snapshot.current_step.clone(),
-        session_id: snapshot.session_id.clone(),
-    }
-}
-
-fn snapshot_from_data(data: WorkerSnapshotData) -> WorkerSnapshot {
-    WorkerSnapshot {
-        id: WorkerId(data.id),
-        name: data.name,
-        issue: data.issue,
-        agent: data.agent,
-        worktree: data.worktree,
-        branch: data.branch,
-        status: WorkerStatus::from_label(&data.status),
-        last_event: data.last_event,
-        workflow: data.workflow,
-        total_steps: data.total_steps,
-        current_step: data.current_step,
-        session_id: data.session_id,
-    }
-}
-
 fn format_action_log(entry: &ActionLogEntry) -> String {
     match &entry.worker {
         Some(worker) => format!("[{}][{}] {}", entry.timestamp, worker, entry.message),
@@ -1065,5 +1015,6 @@ fn status_color(status: WorkerStatus) -> Color {
         WorkerStatus::Paused => Color::Yellow,
         WorkerStatus::Failed => Color::Red,
         WorkerStatus::Idle => Color::Gray,
+        WorkerStatus::Archived => Color::Blue,
     }
 }

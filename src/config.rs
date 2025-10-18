@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -12,7 +12,7 @@ pub struct Config {
     pub default_workflow: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Workflow {
     pub name: String,
     #[serde(default)]
@@ -21,7 +21,7 @@ pub struct Workflow {
     pub steps: Vec<WorkflowStep>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkflowStep {
     pub name: String,
     #[serde(default)]
@@ -32,7 +32,7 @@ pub struct WorkflowStep {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ClaudeStep {
     pub prompt: String,
     #[serde(default)]

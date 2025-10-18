@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Workflow;
+
 #[derive(Debug, Clone)]
 pub struct StateStore {
     base: PathBuf,
@@ -19,6 +21,8 @@ pub struct ManagerState {
 pub struct WorkerRecord {
     pub snapshot: WorkerSnapshotData,
     pub logs: Vec<String>,
+    pub workflow: Workflow,
+    pub completed_steps: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,7 @@ pub enum WorkerStatus {
     Running,
     Paused,
     Failed,
+    Archived,
 }
 
 impl WorkerStatus {
@@ -33,15 +34,7 @@ impl WorkerStatus {
             WorkerStatus::Running => "Running",
             WorkerStatus::Paused => "Paused",
             WorkerStatus::Failed => "Failed",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Self {
-        match label {
-            "Running" => WorkerStatus::Running,
-            "Paused" => WorkerStatus::Paused,
-            "Failed" => WorkerStatus::Failed,
-            _ => WorkerStatus::Idle,
+            WorkerStatus::Archived => "Archived",
         }
     }
 }
@@ -187,7 +180,103 @@ impl WorkerManager {
         }
     }
 
+    fn restore_workers(&mut self) {
+        let records = match self.state_store.load_workers() {
+            Ok(records) => records,
+            Err(err) => {
+                eprintln!("Failed to load worker states: {err}");
+                return;
+            }
+        };
+
+        for record in records {
+            let worktree_path = self.repo_root.join(&record.snapshot.worktree);
+            let worker_id = WorkerId(record.snapshot.id);
+
+            // Update next_id to avoid conflicts
+            if record.snapshot.id >= self.next_id {
+                self.next_id = record.snapshot.id + 1;
+                self.persist_manager_state();
+            }
+
+            let worktree_exists = worktree_path.exists();
+
+            // Create snapshot from saved data
+            let snapshot = WorkerSnapshot {
+                id: worker_id,
+                name: record.snapshot.name.clone(),
+                issue: record.snapshot.issue.clone(),
+                agent: record.snapshot.agent.clone(),
+                worktree: record.snapshot.worktree.clone(),
+                branch: record.snapshot.branch.clone(),
+                status: if worktree_exists {
+                    WorkerStatus::Idle
+                } else {
+                    WorkerStatus::Archived
+                },
+                last_event: if worktree_exists {
+                    "Restored from saved state".to_string()
+                } else {
+                    "Archived (worktree removed)".to_string()
+                },
+                workflow: record.workflow.name.clone(),
+                total_steps: record.workflow.steps.len(),
+                current_step: None,
+                session_id: record.snapshot.session_id.clone(),
+            };
+
+            if worktree_exists {
+                // Create WorkerRuntime for active workers
+                match WorkerRuntime::new(
+                    snapshot.clone(),
+                    worktree_path,
+                    record.snapshot.branch.clone(),
+                    record.workflow,
+                ) {
+                    Ok(mut runtime) => {
+                        runtime.completed_steps = record.completed_steps;
+
+                        // Restore logs to runtime
+                        for log_line in &record.logs {
+                            runtime.add_log(log_line.clone());
+                        }
+
+                        self.workers.insert(worker_id, runtime);
+
+                        // Notify UI
+                        let _ = self.evt_tx.send(WorkerEvent::Created(snapshot.clone()));
+
+                        // Send logs to UI
+                        for log_line in record.logs {
+                            let _ = self.evt_tx.send(WorkerEvent::Log {
+                                id: worker_id,
+                                line: log_line,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to restore worker {}: {err}", record.snapshot.name);
+                    }
+                }
+            } else {
+                // For archived workers (no worktree), just send to UI for viewing
+                let _ = self.evt_tx.send(WorkerEvent::Created(snapshot.clone()));
+
+                // Send logs to UI
+                for log_line in record.logs {
+                    let _ = self.evt_tx.send(WorkerEvent::Log {
+                        id: worker_id,
+                        line: log_line,
+                    });
+                }
+            }
+        }
+    }
+
     fn run(mut self) {
+        // Restore workers before entering command loop
+        self.restore_workers();
+
         while let Ok(command) = self.cmd_rx.recv() {
             match command {
                 WorkerCommand::Create(request) => {
@@ -347,6 +436,8 @@ impl WorkerManager {
         runtime.start_agent(&self.evt_tx);
         self.workers.insert(worker_id, runtime);
 
+        self.persist_worker(worker_id);
+
         Ok(())
     }
 
@@ -433,6 +524,9 @@ impl WorkerManager {
 
         runtime.stop_agent();
 
+        // Reset completed steps to restart from beginning
+        runtime.completed_steps = 0;
+
         {
             let mut snapshot = runtime.state.lock().expect("worker snapshot poisoned");
             snapshot.status = WorkerStatus::Running;
@@ -442,6 +536,8 @@ impl WorkerManager {
         }
 
         runtime.start_agent(&self.evt_tx);
+
+        self.persist_worker(id);
 
         Ok(())
     }
@@ -454,6 +550,9 @@ impl WorkerManager {
 
         // Stop current agent execution
         runtime.stop_agent();
+
+        // Mark all current steps as completed
+        runtime.completed_steps = runtime.workflow.steps.len();
 
         // Create a new workflow step with the continuation prompt
         let continue_step = WorkflowStep {
@@ -488,6 +587,8 @@ impl WorkerManager {
         // Restart agent with updated workflow
         runtime.start_agent(&self.evt_tx);
 
+        self.persist_worker(id);
+
         Ok(())
     }
 
@@ -504,6 +605,39 @@ impl WorkerManager {
             eprintln!("Failed to persist manager state: {err}");
         }
     }
+
+    fn persist_worker(&self, id: WorkerId) {
+        if let Some(runtime) = self.workers.get(&id) {
+            use crate::state::{WorkerRecord, WorkerSnapshotData};
+
+            let snapshot = runtime.snapshot();
+            let logs = runtime.get_logs();
+
+            let record = WorkerRecord {
+                snapshot: WorkerSnapshotData {
+                    id: snapshot.id.0,
+                    name: snapshot.name.clone(),
+                    issue: snapshot.issue.clone(),
+                    agent: snapshot.agent.clone(),
+                    worktree: snapshot.worktree.clone(),
+                    branch: snapshot.branch.clone(),
+                    status: snapshot.status.label().to_string(),
+                    last_event: snapshot.last_event.clone(),
+                    workflow: snapshot.workflow.clone(),
+                    total_steps: snapshot.total_steps,
+                    current_step: snapshot.current_step.clone(),
+                    session_id: snapshot.session_id.clone(),
+                },
+                logs,
+                workflow: runtime.workflow.clone(),
+                completed_steps: runtime.completed_steps,
+            };
+
+            if let Err(err) = self.state_store.save_worker(&record) {
+                eprintln!("Failed to persist worker {}: {err}", snapshot.name);
+            }
+        }
+    }
 }
 
 struct WorkerRuntime {
@@ -513,6 +647,8 @@ struct WorkerRuntime {
     worktree_path: PathBuf,
     branch: String,
     workflow: Workflow,
+    completed_steps: usize,
+    logs: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl WorkerRuntime {
@@ -529,11 +665,30 @@ impl WorkerRuntime {
             worktree_path,
             branch,
             workflow,
+            completed_steps: 0,
+            logs: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
     fn snapshot(&self) -> WorkerSnapshot {
         self.state.lock().expect("worker snapshot poisoned").clone()
+    }
+
+    fn add_log(&self, line: String) {
+        if let Ok(mut logs) = self.logs.lock() {
+            const MAX_LOGS: usize = 1000;
+            if logs.len() >= MAX_LOGS {
+                logs.pop_front();
+            }
+            logs.push_back(line);
+        }
+    }
+
+    fn get_logs(&self) -> Vec<String> {
+        self.logs
+            .lock()
+            .map(|logs| logs.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn start_agent(&mut self, evt_tx: &Sender<WorkerEvent>) {
@@ -545,10 +700,11 @@ impl WorkerRuntime {
         let evt_tx = evt_tx.clone();
         let worktree_path = self.worktree_path.clone();
         let workflow = self.workflow.clone();
+        let start_step = self.completed_steps;
 
         let handle = thread::Builder::new()
             .name(format!("gensui-agent-{}", self.snapshot().name))
-            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow))
+            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow, start_step))
             .expect("failed to spawn agent simulation");
 
         self.handle = Some(handle);
@@ -568,6 +724,7 @@ fn agent_simulation(
     worktree_path: PathBuf,
     evt_tx: Sender<WorkerEvent>,
     workflow: Workflow,
+    start_step: usize,
 ) {
     let worker_id = {
         state
@@ -588,11 +745,13 @@ fn agent_simulation(
         return;
     }
 
-    if let Ok(mut snapshot) = state.lock() {
-        snapshot.status = WorkerStatus::Running;
-        snapshot.last_event = format!("ワークフロー '{}' を開始", workflow.name);
-        snapshot.current_step = None;
-        let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+    if start_step == 0 {
+        if let Ok(mut snapshot) = state.lock() {
+            snapshot.status = WorkerStatus::Running;
+            snapshot.last_event = format!("ワークフロー '{}' を開始", workflow.name);
+            snapshot.current_step = None;
+            let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+        }
     }
 
     if cancel.load(Ordering::SeqCst) {
@@ -600,6 +759,11 @@ fn agent_simulation(
     }
 
     for (idx, step) in workflow.steps().iter().enumerate() {
+        // Skip already completed steps
+        if idx < start_step {
+            continue;
+        }
+
         if cancel.load(Ordering::SeqCst) {
             if let Ok(mut snapshot) = state.lock() {
                 snapshot.status = WorkerStatus::Paused;
@@ -647,43 +811,17 @@ fn agent_simulation(
         let result = if let Some(claude_cfg) = &step.claude {
             let prompt = render_prompt(&claude_cfg.prompt, &snapshot_info);
 
-            // Show the actual prompt being sent
+            // Show the prompt
             let _ = evt_tx.send(WorkerEvent::Log {
                 id: worker_id,
                 line: "─── Prompt ───".to_string(),
             });
-            // Split prompt into lines and show each line
-            for line in prompt.lines().take(10) {
+            for line in prompt.lines() {
                 let _ = evt_tx.send(WorkerEvent::Log {
                     id: worker_id,
-                    line: format!("  {}", line),
+                    line: line.to_string(),
                 });
             }
-            if prompt.lines().count() > 10 {
-                let _ = evt_tx.send(WorkerEvent::Log {
-                    id: worker_id,
-                    line: format!("  ... ({} more lines)", prompt.lines().count() - 10),
-                });
-            }
-            let _ = evt_tx.send(WorkerEvent::Log {
-                id: worker_id,
-                line: "─── Executing ───".to_string(),
-            });
-
-            // Log command details
-            let mut cmd_parts = vec!["claude", "--print", "--output-format", "stream-json", "--verbose"];
-            if let Some(model) = &claude_cfg.model {
-                cmd_parts.push("--model");
-                cmd_parts.push(model);
-            }
-            if let Some(mode) = &claude_cfg.permission_mode {
-                cmd_parts.push("--permission-mode");
-                cmd_parts.push(mode);
-            }
-            let _ = evt_tx.send(WorkerEvent::Log {
-                id: worker_id,
-                line: format!("<Claude> {}", cmd_parts.join(" ")),
-            });
 
             // Pass current session_id to continue the session
             let current_session_id = snapshot_info.session_id.as_deref();
@@ -858,42 +996,9 @@ fn run_claude_command(
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
             match json.get("type").and_then(|v| v.as_str()) {
                 Some("system") => {
-                    // Session initialization
+                    // Session initialization - extract session_id but don't log
                     if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
                         extracted_session_id = Some(sid.to_string());
-                        lines.push(format!("Session: {}", &sid[..8.min(sid.len())]));
-                    }
-                }
-                Some("assistant") => {
-                    // Extract text content from assistant message
-                    if let Some(message) = json.get("message") {
-                        if let Some(content_array) = message.get("content").and_then(|v| v.as_array()) {
-                            for content_item in content_array {
-                                match content_item.get("type").and_then(|v| v.as_str()) {
-                                    Some("text") => {
-                                        if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
-                                            // Check if this is an error message
-                                            if text.contains("API Error:") || text.contains("\"type\":\"error\"") {
-                                                lines.push("❌ Error encountered:".to_string());
-                                            }
-                                            // Split long text into multiple lines for readability
-                                            for text_line in text.lines() {
-                                                lines.push(text_line.to_string());
-                                            }
-                                        }
-                                    }
-                                    Some("tool_use") => {
-                                        if let Some(name) = content_item.get("name").and_then(|v| v.as_str()) {
-                                            lines.push(format!("🔧 Using tool: {}", name));
-                                        }
-                                    }
-                                    Some("thinking") => {
-                                        lines.push("💭 Thinking...".to_string());
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
                     }
                 }
                 Some("result") => {
@@ -911,11 +1016,6 @@ fn run_claude_command(
                             }
                         }
                     }
-
-                    // Show cost information if available
-                    if let Some(cost) = json.get("total_cost_usd").and_then(|v| v.as_f64()) {
-                        lines.push(format!("💰 Cost: ${:.4}", cost));
-                    }
                 }
                 Some("error") => {
                     // API error response
@@ -924,23 +1024,12 @@ fn run_claude_command(
                         if let Some(message) = error_obj.get("message").and_then(|v| v.as_str()) {
                             lines.push(format!("  {}", message));
                         }
-                        if let Some(error_type) = error_obj.get("type").and_then(|v| v.as_str()) {
-                            lines.push(format!("  Type: {}", error_type));
-                        }
                     }
                 }
-                Some("tool_result") => {
-                    // Tool execution result - could show this for debugging
-                    lines.push("✓ Tool completed".to_string());
-                }
                 _ => {
-                    // Unknown type - log for debugging
-                    lines.push(format!("DEBUG: {}", line));
+                    // Ignore other event types (assistant, tool_use, thinking, etc.)
                 }
             }
-        } else {
-            // Not JSON, treat as plain text
-            lines.push(line.to_string());
         }
     }
 
