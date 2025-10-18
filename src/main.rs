@@ -87,6 +87,8 @@ struct App {
     log_scroll: usize,
     status_filter: Option<WorkerStatus>,
     input_mode: Option<InputMode>,
+    log_view_mode: LogViewMode,
+    selected_step: usize,
 }
 
 impl App {
@@ -141,6 +143,8 @@ impl App {
             log_scroll: 0,
             status_filter: None,
             input_mode: None,
+            log_view_mode: LogViewMode::Overview,
+            selected_step: 0,
         })
     }
 
@@ -216,16 +220,42 @@ impl App {
             KeyCode::Char('l') => self.toggle_logs(),
             KeyCode::Char('w') => self.cycle_workflow(),
             KeyCode::Char('a') => self.cycle_filter(),
+            KeyCode::Tab => {
+                if self.show_logs {
+                    self.switch_log_tab_next();
+                }
+            }
+            KeyCode::BackTab => {
+                if self.show_logs {
+                    self.switch_log_tab_prev();
+                }
+            }
+            KeyCode::Enter => {
+                if self.show_logs && self.log_view_mode == LogViewMode::Overview {
+                    self.enter_detail_from_overview();
+                }
+            }
+            KeyCode::Esc => {
+                if self.show_logs && (self.log_view_mode == LogViewMode::Detail || self.log_view_mode == LogViewMode::Raw) {
+                    self.back_to_overview();
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.show_logs {
-                    self.scroll_log_up();
+                    match self.log_view_mode {
+                        LogViewMode::Overview => self.select_step_up(),
+                        LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_up(),
+                    }
                 } else {
                     self.select_previous();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.show_logs {
-                    self.scroll_log_down();
+                    match self.log_view_mode {
+                        LogViewMode::Overview => self.select_step_down(),
+                        LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_down(),
+                    }
                 } else {
                     self.select_next();
                 }
@@ -323,9 +353,11 @@ impl App {
 
     fn toggle_logs(&mut self) {
         self.show_logs = !self.show_logs;
-        // Reset scroll when opening logs
+        // Reset scroll and view mode when opening logs
         if self.show_logs {
             self.log_scroll = 0;
+            self.log_view_mode = LogViewMode::Overview;
+            self.selected_step = 0;
         }
     }
 
@@ -361,6 +393,45 @@ impl App {
             self.log_messages.pop_front();
         }
         self.push_log("アクションログを圧縮しました".into());
+    }
+
+    fn switch_log_tab_next(&mut self) {
+        self.log_view_mode = match self.log_view_mode {
+            LogViewMode::Overview => LogViewMode::Detail,
+            LogViewMode::Detail => LogViewMode::Raw,
+            LogViewMode::Raw => LogViewMode::Overview,
+        };
+        self.log_scroll = 0;
+    }
+
+    fn switch_log_tab_prev(&mut self) {
+        self.log_view_mode = match self.log_view_mode {
+            LogViewMode::Overview => LogViewMode::Raw,
+            LogViewMode::Raw => LogViewMode::Detail,
+            LogViewMode::Detail => LogViewMode::Overview,
+        };
+        self.log_scroll = 0;
+    }
+
+    fn select_step_up(&mut self) {
+        self.selected_step = self.selected_step.saturating_sub(1);
+    }
+
+    fn select_step_down(&mut self) {
+        if let Some(view) = self.selected_worker_view() {
+            let max = view.structured_logs.len().saturating_sub(1);
+            self.selected_step = (self.selected_step + 1).min(max);
+        }
+    }
+
+    fn enter_detail_from_overview(&mut self) {
+        self.log_view_mode = LogViewMode::Detail;
+        self.log_scroll = 0;
+    }
+
+    fn back_to_overview(&mut self) {
+        self.log_view_mode = LogViewMode::Overview;
+        self.log_scroll = 0;
     }
 
     fn cycle_filter(&mut self) {
@@ -556,8 +627,7 @@ impl App {
         self.render_footer(frame, layout[2]);
 
         if self.show_logs {
-            let (title, lines) = self.log_modal_data();
-            self.render_modal(frame, 70, 45, &title, lines);
+            self.render_log_modal(frame);
         }
 
         if self.show_help {
@@ -844,6 +914,164 @@ impl App {
         (title, visible_lines)
     }
 
+    fn render_log_modal(&self, frame: &mut ratatui::Frame<'_>) {
+        match self.log_view_mode {
+            LogViewMode::Overview => self.render_overview_tab(frame),
+            LogViewMode::Detail => self.render_detail_tab(frame),
+            LogViewMode::Raw => {
+                let (title, lines) = self.log_modal_data();
+                self.render_modal(frame, 70, 45, &title, lines);
+            }
+        }
+    }
+
+    fn render_overview_tab(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = centered_rect(80, 60, frame.area());
+
+        if let Some(view) = self.selected_worker_view() {
+            let entries = &view.structured_logs;
+
+            if entries.is_empty() {
+                let lines = vec![Line::raw("このワーカーにはまだステップログがありません。")];
+                let title = "Overview [Tab:switch tabs]";
+                let widget = Paragraph::new(lines)
+                    .block(Block::default().borders(Borders::ALL).title(title));
+                frame.render_widget(Clear, area);
+                frame.render_widget(widget, area);
+                return;
+            }
+
+            // Build table rows
+            let header = Row::new(vec!["#", "Step", "Status", "Summary"])
+                .style(Style::default().add_modifier(Modifier::BOLD))
+                .bottom_margin(1);
+
+            let rows: Vec<Row> = entries
+                .iter()
+                .map(|entry| {
+                    let status_str = match entry.status {
+                        StepStatus::Running => "Running",
+                        StepStatus::Success => "✓ Success",
+                        StepStatus::Failed => "✗ Failed",
+                    };
+
+                    let summary = entry
+                        .result_lines
+                        .first()
+                        .map(|s| {
+                            if s.len() > 60 {
+                                format!("{}...", &s[..60])
+                            } else {
+                                s.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| "(no result)".to_string());
+
+                    let style = if entry.step_index == self.selected_step {
+                        Style::default().bg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    };
+
+                    Row::new(vec![
+                        format!("{}", entry.step_index),
+                        entry.step_name.clone(),
+                        status_str.to_string(),
+                        summary,
+                    ])
+                    .style(style)
+                })
+                .collect();
+
+            let widths = [
+                Constraint::Length(4),
+                Constraint::Length(20),
+                Constraint::Length(12),
+                Constraint::Percentage(60),
+            ];
+
+            let table = Table::new(rows, widths)
+                .header(header)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Overview [Tab:switch tabs | Enter:detail | j/k:select]"),
+                );
+
+            frame.render_widget(Clear, area);
+            frame.render_widget(table, area);
+        } else {
+            // Show action logs (no structured logs available)
+            let (title, lines) = self.log_modal_data();
+            let widget = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(title));
+            frame.render_widget(Clear, area);
+            frame.render_widget(widget, area);
+        }
+    }
+
+    fn render_detail_tab(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = centered_rect(80, 60, frame.area());
+
+        if let Some(view) = self.selected_worker_view() {
+            if let Some(entry) = view.structured_logs.get(self.selected_step) {
+                let mut lines = Vec::new();
+
+                // Title
+                lines.push(Line::from(format!(
+                    "Step #{}: {}",
+                    entry.step_index, entry.step_name
+                )));
+                lines.push(Line::raw(""));
+
+                // Prompt section
+                lines.push(Line::from(Span::styled(
+                    "─── Prompt ───",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                for line in &entry.prompt_lines {
+                    lines.push(Line::from(line.clone()));
+                }
+                lines.push(Line::raw(""));
+
+                // Result section
+                lines.push(Line::from(Span::styled(
+                    "─── Result ───",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                for line in &entry.result_lines {
+                    lines.push(Line::from(line.clone()));
+                }
+
+                let visible_lines: Vec<Line> = lines.iter().skip(self.log_scroll).cloned().collect();
+
+                let title = format!(
+                    "Detail - Step {} [Tab:switch tabs | Esc:back | ↑↓:scroll]",
+                    entry.step_index
+                );
+
+                let widget = Paragraph::new(visible_lines)
+                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .wrap(Wrap { trim: false });
+
+                frame.render_widget(Clear, area);
+                frame.render_widget(widget, area);
+            } else {
+                let lines = vec![Line::raw("選択されたステップが見つかりません。")];
+                let widget = Paragraph::new(lines)
+                    .block(Block::default().borders(Borders::ALL).title("Detail"));
+                frame.render_widget(Clear, area);
+                frame.render_widget(widget, area);
+            }
+        } else {
+            let lines = vec![Line::raw("ワーカーが選択されていません。")];
+            let widget = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Detail"));
+            frame.render_widget(Clear, area);
+            frame.render_widget(widget, area);
+        }
+    }
+
     fn add_or_update_worker(&mut self, snapshot: WorkerSnapshot) {
         if let Some(pos) = self
             .workers
@@ -947,6 +1175,37 @@ impl App {
 struct WorkerView {
     snapshot: WorkerSnapshot,
     logs: VecDeque<String>,
+    structured_logs: Vec<LogEntry>,
+    // Parser state
+    current_step_index: Option<usize>,
+    current_step_name: Option<String>,
+    current_prompt: Vec<String>,
+    current_result: Vec<String>,
+    in_prompt: bool,
+    in_result: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LogEntry {
+    step_index: usize,
+    step_name: String,
+    prompt_lines: Vec<String>,
+    result_lines: Vec<String>,
+    status: StepStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepStatus {
+    Running,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogViewMode {
+    Overview,
+    Detail,
+    Raw,
 }
 
 impl WorkerView {
@@ -956,6 +1215,13 @@ impl WorkerView {
         Self {
             snapshot,
             logs: VecDeque::with_capacity(Self::LOG_CAPACITY),
+            structured_logs: Vec::new(),
+            current_step_index: None,
+            current_step_name: None,
+            current_prompt: Vec::new(),
+            current_result: Vec::new(),
+            in_prompt: false,
+            in_result: false,
         }
     }
 
@@ -967,7 +1233,69 @@ impl WorkerView {
         if self.logs.len() >= Self::LOG_CAPACITY {
             self.logs.pop_front();
         }
-        self.logs.push_back(line);
+        self.logs.push_back(line.clone());
+
+        // Parse structured log markers
+        self.parse_log_line(&line);
+    }
+
+    fn parse_log_line(&mut self, line: &str) {
+        if line.starts_with("[STEP_START:") {
+            // Extract step index and name
+            if let Some(content) = line.strip_prefix("[STEP_START:").and_then(|s| s.strip_suffix("]")) {
+                let parts: Vec<&str> = content.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    if let Ok(idx) = parts[0].parse::<usize>() {
+                        self.current_step_index = Some(idx);
+                        self.current_step_name = Some(parts[1].to_string());
+                        self.current_prompt.clear();
+                        self.current_result.clear();
+                    }
+                }
+            }
+        } else if line == "[PROMPT_START]" {
+            self.in_prompt = true;
+            self.in_result = false;
+        } else if line == "[PROMPT_END]" {
+            self.in_prompt = false;
+        } else if line == "[RESULT_START]" {
+            self.in_prompt = false;
+            self.in_result = true;
+        } else if line == "[RESULT_END]" {
+            self.in_result = false;
+        } else if line.starts_with("[STEP_END:") {
+            // Finalize current step
+            if let Some(content) = line.strip_prefix("[STEP_END:").and_then(|s| s.strip_suffix("]")) {
+                let status = match content {
+                    "Success" => StepStatus::Success,
+                    "Failed" => StepStatus::Failed,
+                    _ => StepStatus::Running,
+                };
+
+                if let (Some(idx), Some(name)) = (self.current_step_index, &self.current_step_name) {
+                    let entry = LogEntry {
+                        step_index: idx,
+                        step_name: name.clone(),
+                        prompt_lines: self.current_prompt.clone(),
+                        result_lines: self.current_result.clone(),
+                        status,
+                    };
+                    self.structured_logs.push(entry);
+
+                    // Reset state
+                    self.current_step_index = None;
+                    self.current_step_name = None;
+                    self.current_prompt.clear();
+                    self.current_result.clear();
+                }
+            }
+        } else if self.in_prompt && !line.starts_with("─") {
+            // Collect prompt lines (skip separator lines)
+            self.current_prompt.push(line.to_string());
+        } else if self.in_result && !line.starts_with("─") {
+            // Collect result lines (skip separator lines)
+            self.current_result.push(line.to_string());
+        }
     }
 }
 

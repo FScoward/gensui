@@ -803,6 +803,12 @@ fn agent_simulation(
             }
         };
 
+        // Step start marker
+        let _ = evt_tx.send(WorkerEvent::Log {
+            id: worker_id,
+            line: format!("[STEP_START:{}:{}]", idx, step.name),
+        });
+
         let _ = evt_tx.send(WorkerEvent::Log {
             id: worker_id,
             line: format!("[{}] {}", step.name, step_desc),
@@ -811,7 +817,11 @@ fn agent_simulation(
         let result = if let Some(claude_cfg) = &step.claude {
             let prompt = render_prompt(&claude_cfg.prompt, &snapshot_info);
 
-            // Show the prompt
+            // Prompt section
+            let _ = evt_tx.send(WorkerEvent::Log {
+                id: worker_id,
+                line: "[PROMPT_START]".to_string(),
+            });
             let _ = evt_tx.send(WorkerEvent::Log {
                 id: worker_id,
                 line: "─── Prompt ───".to_string(),
@@ -822,6 +832,10 @@ fn agent_simulation(
                     line: line.to_string(),
                 });
             }
+            let _ = evt_tx.send(WorkerEvent::Log {
+                id: worker_id,
+                line: "[PROMPT_END]".to_string(),
+            });
 
             // Pass current session_id to continue the session
             let current_session_id = snapshot_info.session_id.as_deref();
@@ -846,6 +860,12 @@ fn agent_simulation(
             Ok(vec!["(no-op step)".into()])
         };
 
+        // Result section
+        let _ = evt_tx.send(WorkerEvent::Log {
+            id: worker_id,
+            line: "[RESULT_START]".to_string(),
+        });
+
         match result {
             Ok(lines) => {
                 for line in lines {
@@ -854,8 +874,31 @@ fn agent_simulation(
                         line,
                     });
                 }
+                let _ = evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: "[RESULT_END]".to_string(),
+                });
+                // Step end marker (success)
+                let _ = evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: "[STEP_END:Success]".to_string(),
+                });
             }
             Err(err) => {
+                let _ = evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: format!("Error: {err}"),
+                });
+                let _ = evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: "[RESULT_END]".to_string(),
+                });
+                // Step end marker (failed)
+                let _ = evt_tx.send(WorkerEvent::Log {
+                    id: worker_id,
+                    line: "[STEP_END:Failed]".to_string(),
+                });
+
                 if let Ok(mut snapshot) = state.lock() {
                     snapshot.status = WorkerStatus::Failed;
                     snapshot.last_event = format!("Command failed: {err}");
