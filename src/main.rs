@@ -167,10 +167,6 @@ impl App {
                         let prompt = buffer.trim().to_string();
                         let is_force_new = *force_new;
                         let is_plan_mode = *plan_mode;
-                        eprintln!(
-                            "[DEBUG] Enter pressed in FreePrompt mode: plan_mode={}, force_new={}",
-                            is_plan_mode, is_force_new
-                        );
                         self.input_mode = None;
                         if !prompt.is_empty() {
                             self.submit_free_prompt(prompt, is_force_new, is_plan_mode);
@@ -186,10 +182,6 @@ impl App {
                     }
                     KeyCode::Char('p') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                         *plan_mode = !*plan_mode;
-                        eprintln!(
-                            "[DEBUG] Ctrl+P pressed, plan_mode toggled to: {}",
-                            *plan_mode
-                        );
                     }
                     KeyCode::Char(c) => {
                         if !key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -212,9 +204,6 @@ impl App {
                             self.enqueue_create_worker();
                         } else if choice == 1 {
                             // Free input - always create new worker
-                            eprintln!(
-                                "[DEBUG] CreateWorkerSelection: creating FreePrompt with plan_mode=false (default)"
-                            );
                             self.input_mode = Some(InputMode::FreePrompt {
                                 buffer: String::new(),
                                 force_new: true,
@@ -674,14 +663,9 @@ impl App {
         }
 
         // No worker selected or force_new is true - create new worker
-        eprintln!("[DEBUG] submit_free_prompt: plan_mode={}", plan_mode);
         let mut request = CreateWorkerRequest::default();
         request.free_prompt = Some(trimmed.to_string());
         request.plan_mode = Some(plan_mode);
-        eprintln!(
-            "[DEBUG] CreateWorkerRequest.plan_mode set to: {:?}",
-            request.plan_mode
-        );
 
         match self.manager.create_worker(request) {
             Ok(_) => {
