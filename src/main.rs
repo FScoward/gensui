@@ -20,8 +20,8 @@ use crate::config::{Config, Workflow};
 use crate::state::{ActionLogEntry, StateStore};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use worker::{
-    CreateWorkerRequest, WorkerEvent, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
-    WorkerStatus, spawn_worker_system,
+    CreateWorkerRequest, ExistingWorktree, WorkerEvent, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
+    WorkerStatus, list_existing_worktrees, spawn_worker_system,
 };
 
 const GLOBAL_LOG_CAPACITY: usize = 64;
@@ -74,6 +74,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 }
 
 struct App {
+    repo_root: std::path::PathBuf,
     manager: WorkerHandle,
     event_rx: WorkerEventReceiver,
     state_store: StateStore,
@@ -128,9 +129,10 @@ impl App {
             log_messages.push_back(format_action_log(&entry));
         }
 
-        let (manager, event_rx) = spawn_worker_system(repo_root, config)?;
+        let (manager, event_rx) = spawn_worker_system(repo_root.clone(), config)?;
 
         Ok(Self {
+            repo_root,
             manager,
             event_rx,
             state_store,
@@ -192,19 +194,43 @@ impl App {
                         if choice == 0 {
                             // Run workflow
                             self.enqueue_create_worker();
-                        } else {
+                        } else if choice == 1 {
                             // Free input - always create new worker
                             self.input_mode = Some(InputMode::FreePrompt {
                                 buffer: String::new(),
                                 force_new: true,
                             });
+                        } else {
+                            // Use existing worktree
+                            self.show_worktree_selection();
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         *selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        *selected = (*selected + 1).min(1);
+                        *selected = (*selected + 1).min(2);
+                    }
+                    _ => {}
+                },
+                InputMode::WorktreeSelection { worktrees, selected } => match key_event.code {
+                    KeyCode::Esc => {
+                        self.input_mode = None;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(worktree) = worktrees.get(*selected) {
+                            let worktree_path = worktree.path.clone();
+                            let branch = worktree.branch.clone();
+                            self.input_mode = None;
+                            self.enqueue_create_worker_with_worktree(worktree_path, branch);
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let max_idx = worktrees.len().saturating_sub(1);
+                        *selected = (*selected + 1).min(max_idx);
                     }
                     _ => {}
                 },
@@ -528,6 +554,39 @@ impl App {
         self.input_mode = Some(InputMode::CreateWorkerSelection { selected: 0 });
     }
 
+    fn show_worktree_selection(&mut self) {
+        match list_existing_worktrees(&self.repo_root) {
+            Ok(worktrees) => {
+                if worktrees.is_empty() {
+                    self.push_log("既存のworktreeが見つかりませんでした".to_string());
+                    return;
+                }
+                self.input_mode = Some(InputMode::WorktreeSelection {
+                    worktrees,
+                    selected: 0,
+                });
+            }
+            Err(err) => {
+                self.push_log(format!("worktreeの一覧取得に失敗しました: {err}"));
+            }
+        }
+    }
+
+    fn enqueue_create_worker_with_worktree(&mut self, worktree_path: std::path::PathBuf, branch: String) {
+        let mut request = CreateWorkerRequest::default();
+        request.workflow = self
+            .workflows
+            .get(self.selected_workflow_idx)
+            .map(|wf| wf.name.clone());
+        request.existing_worktree = Some((worktree_path.clone(), branch.clone()));
+
+        if let Err(err) = self.manager.create_worker(request) {
+            self.push_log(format!("ワーカー作成に失敗しました: {err}"));
+        } else {
+            self.push_log(format!("既存worktree '{}'でワーカーを作成しました", worktree_path.display()));
+        }
+    }
+
     fn start_free_prompt(&mut self) {
         self.input_mode = Some(InputMode::FreePrompt {
             buffer: String::new(),
@@ -713,6 +772,9 @@ impl App {
                 }
                 InputMode::CreateWorkerSelection { selected } => {
                     self.render_create_selection_modal(frame, *selected);
+                }
+                InputMode::WorktreeSelection { worktrees, selected } => {
+                    self.render_worktree_selection_modal(frame, worktrees, *selected);
                 }
             }
         }
@@ -994,6 +1056,7 @@ impl App {
         let options = vec![
             format!("  ワークフローを実行 ({})", workflow_name),
             "  自由入力でワーカーを作成".to_string(),
+            "  既存worktreeを使用".to_string(),
         ];
 
         let lines: Vec<Line> = vec![
@@ -1022,6 +1085,40 @@ impl App {
         let widget = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Create Worker"));
+        frame.render_widget(Clear, area);
+        frame.render_widget(widget, area);
+    }
+
+    fn render_worktree_selection_modal(&self, frame: &mut ratatui::Frame<'_>, worktrees: &[ExistingWorktree], selected: usize) {
+        let area = centered_rect(70, 50, frame.area());
+
+        let lines: Vec<Line> = vec![
+            Line::raw("既存のworktreeを選択してください"),
+            Line::raw(""),
+        ]
+        .into_iter()
+        .chain(worktrees.iter().enumerate().map(|(i, wt)| {
+            let display_text = format!("  {} (branch: {})", wt.path.display(), wt.branch);
+            if i == selected {
+                Line::from(Span::styled(
+                    format!("> {}", display_text),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(display_text)
+            }
+        }))
+        .chain(vec![
+            Line::raw(""),
+            Line::raw("↑↓: 選択移動  Enter: 決定  Esc: キャンセル"),
+        ])
+        .collect();
+
+        let widget = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Select Worktree"));
         frame.render_widget(Clear, area);
         frame.render_widget(widget, area);
     }
@@ -1492,6 +1589,7 @@ impl WorkerView {
 enum InputMode {
     FreePrompt { buffer: String, force_new: bool },
     CreateWorkerSelection { selected: usize },
+    WorktreeSelection { worktrees: Vec<ExistingWorktree>, selected: usize },
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

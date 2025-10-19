@@ -62,6 +62,13 @@ pub struct CreateWorkerRequest {
     pub agent: Option<String>,
     pub workflow: Option<String>,
     pub free_prompt: Option<String>,
+    pub existing_worktree: Option<(PathBuf, String)>, // (worktree_path, branch_name)
+}
+
+#[derive(Clone, Debug)]
+pub struct ExistingWorktree {
+    pub path: PathBuf,
+    pub branch: String,
 }
 
 pub enum WorkerCommand {
@@ -331,42 +338,55 @@ impl WorkerManager {
         self.next_id += 1;
         self.persist_manager_state();
 
-        fs::create_dir_all(self.repo_root.join(".worktrees"))
-            .context("failed to create .worktrees directory")?;
+        let (worktree_path, branch, rel_worktree) = if let Some((existing_path, existing_branch)) = request.existing_worktree {
+            // Use existing worktree
+            let rel_path = existing_path
+                .strip_prefix(&self.repo_root)
+                .unwrap_or(&existing_path)
+                .to_string_lossy()
+                .to_string();
+            (existing_path, existing_branch, rel_path)
+        } else {
+            // Create new worktree
+            fs::create_dir_all(self.repo_root.join(".worktrees"))
+                .context("failed to create .worktrees directory")?;
 
-        let timestamp = OffsetDateTime::now_utc().unix_timestamp();
-        let worktree_name = format!("worker-{id:03}-{timestamp}", id = worker_id.0);
-        let rel_worktree = format!(".worktrees/{worktree_name}");
-        let worktree_path = self.repo_root.join(&rel_worktree);
+            let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+            let worktree_name = format!("worker-{id:03}-{timestamp}", id = worker_id.0);
+            let rel_worktree = format!(".worktrees/{worktree_name}");
+            let worktree_path = self.repo_root.join(&rel_worktree);
 
-        let branch = format!("gensui/{worktree_name}");
-        let base_ref = determine_base_ref(&self.repo_root).unwrap_or_else(|| "HEAD".into());
+            let branch = format!("gensui/{worktree_name}");
+            let base_ref = determine_base_ref(&self.repo_root).unwrap_or_else(|| "HEAD".into());
 
-        let output = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                &worktree_path.to_string_lossy(),
-                "-b",
-                &branch,
-                &base_ref,
-            ])
-            .current_dir(&self.repo_root)
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .output()
-            .with_context(|| "failed to execute git worktree add")?;
+            let output = Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    &worktree_path.to_string_lossy(),
+                    "-b",
+                    &branch,
+                    &base_ref,
+                ])
+                .current_dir(&self.repo_root)
+                .stderr(Stdio::piped())
+                .stdout(Stdio::piped())
+                .output()
+                .with_context(|| "failed to execute git worktree add")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(anyhow!(
-                "git worktree add failed: status={} stdout='{}' stderr='{}'",
-                output.status,
-                stdout.trim(),
-                stderr.trim()
-            ));
-        }
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return Err(anyhow!(
+                    "git worktree add failed: status={} stdout='{}' stderr='{}'",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ));
+            }
+
+            (worktree_path, branch, rel_worktree)
+        };
 
         let workflow = if let Some(prompt) = request.free_prompt.clone() {
             Workflow {
@@ -1151,4 +1171,51 @@ fn determine_base_ref(repo_root: &Path) -> Option<String> {
     } else {
         Some(branch)
     }
+}
+
+pub fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWorktree>> {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output()
+        .context("failed to execute git worktree list")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("git worktree list failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut worktrees = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+
+    for line in stdout.lines() {
+        if line.starts_with("worktree ") {
+            // Save previous worktree if complete
+            if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take()) {
+                worktrees.push(ExistingWorktree { path, branch });
+            }
+            // Start new worktree
+            current_path = Some(PathBuf::from(line.trim_start_matches("worktree ").trim()));
+        } else if line.starts_with("branch ") {
+            let branch_ref = line.trim_start_matches("branch ").trim();
+            // Extract branch name from refs/heads/branch-name
+            if let Some(branch_name) = branch_ref.strip_prefix("refs/heads/") {
+                current_branch = Some(branch_name.to_string());
+            }
+        } else if line.starts_with("detached") {
+            // For detached HEAD, use a placeholder
+            current_branch = Some("(detached HEAD)".to_string());
+        }
+    }
+
+    // Save last worktree
+    if let (Some(path), Some(branch)) = (current_path, current_branch) {
+        worktrees.push(ExistingWorktree { path, branch });
+    }
+
+    Ok(worktrees)
 }
