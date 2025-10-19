@@ -4,6 +4,8 @@ mod worker;
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -48,6 +50,60 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let tick_rate = Duration::from_millis(50);
 
     loop {
+        // Check for interactive mode request
+        if let Some(request) = app.pending_interactive_mode.take() {
+            // Suspend TUI
+            disable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::cursor::Show
+            )?;
+
+            // Display info and wait for user
+            println!("\n=== Interactive Claude Code Session ===");
+            println!("Worker: {}", request.worker_name);
+            println!("Worktree: {}", request.worktree_path.display());
+            println!("\nPress Enter to start Claude Code CLI...");
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            // Launch Claude Code CLI (non-headless mode)
+            let status = Command::new("claude")
+                .current_dir(&request.worktree_path)
+                .status();
+
+            match status {
+                Ok(exit_status) => {
+                    println!("\nClaude Code exited with: {:?}", exit_status);
+                }
+                Err(err) => {
+                    println!("\nFailed to launch Claude Code: {}", err);
+                    println!("Make sure 'claude' command is available in your PATH");
+                }
+            }
+
+            println!("\nPress Enter to return to TUI...");
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+
+            // Resume TUI
+            enable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen
+            )?;
+            terminal.clear()?;
+
+            app.push_log(format!(
+                "インタラクティブセッションから復帰しました ({})",
+                request.worker_name
+            ));
+
+            continue;
+        }
+
         terminal.draw(|frame| app.render(frame))?;
 
         let timeout = tick_rate
@@ -91,6 +147,12 @@ struct App {
     log_view_mode: LogViewMode,
     selected_step: usize,
     animation_frame: usize,
+    pending_interactive_mode: Option<InteractiveRequest>,
+}
+
+struct InteractiveRequest {
+    worker_name: String,
+    worktree_path: PathBuf,
 }
 
 impl App {
@@ -149,6 +211,7 @@ impl App {
             log_view_mode: LogViewMode::Overview,
             selected_step: 0,
             animation_frame: 0,
+            pending_interactive_mode: None,
         })
     }
 
@@ -335,6 +398,9 @@ impl App {
             }
             KeyCode::Char('C') if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.compact_logs()
+            }
+            KeyCode::Char('I') if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.start_interactive_prompt()
             }
             _ => {}
         }
@@ -624,6 +690,29 @@ impl App {
             force_new: false,
             permission_mode: None,
         });
+    }
+
+    fn start_interactive_prompt(&mut self) {
+        // Get selected worker
+        if let Some(worker_id) = self.selected_worker_id() {
+            if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == worker_id) {
+                // Check if archived
+                if worker.snapshot.status == WorkerStatus::Archived {
+                    self.push_log("アーカイブされたワーカーではインタラクティブモードを使用できません".to_string());
+                    return;
+                }
+
+                let worktree_path = self.repo_root.join(&worker.snapshot.worktree);
+                let worker_name = worker.snapshot.name.clone();
+
+                self.pending_interactive_mode = Some(InteractiveRequest {
+                    worker_name,
+                    worktree_path,
+                });
+            }
+        } else {
+            self.push_log("ワーカーを選択してください".to_string());
+        }
     }
 
     fn submit_free_prompt(&mut self, prompt: String, force_new: bool, permission_mode: Option<String>) {
@@ -1217,6 +1306,7 @@ impl App {
             Line::raw("l – 選択ワーカーのログを表示"),
             Line::raw("h – このヘルプを表示"),
             Line::raw("Shift+C – アクションログを圧縮"),
+            Line::raw("Shift+I – インタラクティブClaude Code起動（権限を手動承認可能）"),
             Line::raw("q – 終了"),
             Line::raw(""),
             Line::raw("ステータス: Running/Idle/Paused/Failed/Archived(青=履歴)"),
