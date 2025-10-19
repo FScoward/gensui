@@ -707,10 +707,11 @@ impl WorkerRuntime {
         let worktree_path = self.worktree_path.clone();
         let workflow = self.workflow.clone();
         let start_step = self.completed_steps;
+        let logs = Arc::clone(&self.logs);
 
         let handle = thread::Builder::new()
             .name(format!("gensui-agent-{}", self.snapshot().name))
-            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow, start_step))
+            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow, start_step, logs))
             .expect("failed to spawn agent simulation");
 
         self.handle = Some(handle);
@@ -731,7 +732,26 @@ fn agent_simulation(
     evt_tx: Sender<WorkerEvent>,
     workflow: Workflow,
     start_step: usize,
+    logs: Arc<Mutex<VecDeque<String>>>,
 ) {
+    // Helper function to save log and send event
+    let send_log = |line: String, worker_id: WorkerId| {
+        // Add to logs
+        if let Ok(mut log_queue) = logs.lock() {
+            const MAX_LOGS: usize = 1000;
+            if log_queue.len() >= MAX_LOGS {
+                log_queue.pop_front();
+            }
+            log_queue.push_back(line.clone());
+        }
+
+        // Send event to UI
+        let _ = evt_tx.send(WorkerEvent::Log {
+            id: worker_id,
+            line,
+        });
+    };
+
     let worker_id = {
         state
             .lock()
@@ -810,38 +830,19 @@ fn agent_simulation(
         };
 
         // Step start marker
-        let _ = evt_tx.send(WorkerEvent::Log {
-            id: worker_id,
-            line: format!("[STEP_START:{}:{}]", idx, step.name),
-        });
-
-        let _ = evt_tx.send(WorkerEvent::Log {
-            id: worker_id,
-            line: format!("[{}] {}", step.name, step_desc),
-        });
+        send_log(format!("[STEP_START:{}:{}]", idx, step.name), worker_id);
+        send_log(format!("[{}] {}", step.name, step_desc), worker_id);
 
         let result = if let Some(claude_cfg) = &step.claude {
             let prompt = render_prompt(&claude_cfg.prompt, &snapshot_info);
 
             // Prompt section
-            let _ = evt_tx.send(WorkerEvent::Log {
-                id: worker_id,
-                line: "[PROMPT_START]".to_string(),
-            });
-            let _ = evt_tx.send(WorkerEvent::Log {
-                id: worker_id,
-                line: "─── Prompt ───".to_string(),
-            });
+            send_log("[PROMPT_START]".to_string(), worker_id);
+            send_log("─── Prompt ───".to_string(), worker_id);
             for line in prompt.lines() {
-                let _ = evt_tx.send(WorkerEvent::Log {
-                    id: worker_id,
-                    line: line.to_string(),
-                });
+                send_log(line.to_string(), worker_id);
             }
-            let _ = evt_tx.send(WorkerEvent::Log {
-                id: worker_id,
-                line: "[PROMPT_END]".to_string(),
-            });
+            send_log("[PROMPT_END]".to_string(), worker_id);
 
             // Pass current session_id to continue the session
             let current_session_id = snapshot_info.session_id.as_deref();
@@ -857,53 +858,29 @@ fn agent_simulation(
                     lines
                 })
         } else if let Some(command) = &step.command {
-            let _ = evt_tx.send(WorkerEvent::Log {
-                id: worker_id,
-                line: format!("$ {}", command),
-            });
+            send_log(format!("$ {}", command), worker_id);
             run_shell_command(command, &worktree_path)
         } else {
             Ok(vec!["(no-op step)".into()])
         };
 
         // Result section
-        let _ = evt_tx.send(WorkerEvent::Log {
-            id: worker_id,
-            line: "[RESULT_START]".to_string(),
-        });
+        send_log("[RESULT_START]".to_string(), worker_id);
 
         match result {
             Ok(lines) => {
                 for line in lines {
-                    let _ = evt_tx.send(WorkerEvent::Log {
-                        id: worker_id,
-                        line,
-                    });
+                    send_log(line, worker_id);
                 }
-                let _ = evt_tx.send(WorkerEvent::Log {
-                    id: worker_id,
-                    line: "[RESULT_END]".to_string(),
-                });
+                send_log("[RESULT_END]".to_string(), worker_id);
                 // Step end marker (success)
-                let _ = evt_tx.send(WorkerEvent::Log {
-                    id: worker_id,
-                    line: "[STEP_END:Success]".to_string(),
-                });
+                send_log("[STEP_END:Success]".to_string(), worker_id);
             }
             Err(err) => {
-                let _ = evt_tx.send(WorkerEvent::Log {
-                    id: worker_id,
-                    line: format!("Error: {err}"),
-                });
-                let _ = evt_tx.send(WorkerEvent::Log {
-                    id: worker_id,
-                    line: "[RESULT_END]".to_string(),
-                });
+                send_log(format!("Error: {err}"), worker_id);
+                send_log("[RESULT_END]".to_string(), worker_id);
                 // Step end marker (failed)
-                let _ = evt_tx.send(WorkerEvent::Log {
-                    id: worker_id,
-                    line: "[STEP_END:Failed]".to_string(),
-                });
+                send_log("[STEP_END:Failed]".to_string(), worker_id);
 
                 if let Ok(mut snapshot) = state.lock() {
                     snapshot.status = WorkerStatus::Failed;
@@ -930,10 +907,7 @@ fn agent_simulation(
         let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
     }
 
-    let _ = evt_tx.send(WorkerEvent::Log {
-        id: worker_id,
-        line: format!("Workflow '{}' completed", workflow.name),
-    });
+    send_log(format!("Workflow '{}' completed", workflow.name), worker_id);
 }
 
 fn run_shell_command(command: &str, dir: &Path) -> Result<Vec<String>> {
