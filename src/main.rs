@@ -2,7 +2,7 @@ mod config;
 mod state;
 mod worker;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -20,8 +20,9 @@ use crate::config::{Config, Workflow};
 use crate::state::{ActionLogEntry, StateStore};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use worker::{
-    CreateWorkerRequest, ExistingWorktree, WorkerEvent, WorkerEventReceiver, WorkerHandle,
-    WorkerId, WorkerSnapshot, WorkerStatus, list_existing_worktrees, spawn_worker_system,
+    CreateWorkerRequest, ExistingWorktree, PermissionDecision, PermissionRequest, WorkerEvent,
+    WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot, WorkerStatus,
+    list_existing_worktrees, spawn_worker_system,
 };
 
 const GLOBAL_LOG_CAPACITY: usize = 64;
@@ -91,6 +92,8 @@ struct App {
     log_view_mode: LogViewMode,
     selected_step: usize,
     animation_frame: usize,
+    permission_prompt: Option<PermissionPromptState>,
+    permission_tracker: HashMap<u64, PermissionTrackerEntry>,
 }
 
 impl App {
@@ -149,10 +152,41 @@ impl App {
             log_view_mode: LogViewMode::Overview,
             selected_step: 0,
             animation_frame: 0,
+            permission_prompt: None,
+            permission_tracker: HashMap::new(),
         })
     }
 
     fn handle_key(&mut self, key_event: KeyEvent) -> bool {
+        if let Some(prompt) = self.permission_prompt.as_mut() {
+            match key_event.code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                    if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key_event.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        prompt.toggle();
+                    }
+                }
+                KeyCode::Char('y') if key_event.modifiers.is_empty() => {
+                    let decision = PermissionDecision::Allow;
+                    self.submit_permission_decision(decision);
+                }
+                KeyCode::Char('n') if key_event.modifiers.is_empty() => {
+                    let decision = PermissionDecision::Deny;
+                    self.submit_permission_decision(decision);
+                }
+                KeyCode::Enter => {
+                    let decision = prompt.selection;
+                    self.submit_permission_decision(decision);
+                }
+                KeyCode::Esc => {
+                    self.submit_permission_decision(PermissionDecision::Deny);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         if let Some(mode) = self.input_mode.as_mut() {
             match mode {
                 InputMode::FreePrompt {
@@ -626,7 +660,12 @@ impl App {
         });
     }
 
-    fn submit_free_prompt(&mut self, prompt: String, force_new: bool, permission_mode: Option<String>) {
+    fn submit_free_prompt(
+        &mut self,
+        prompt: String,
+        force_new: bool,
+        permission_mode: Option<String>,
+    ) {
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
             self.push_log("空の指示は送信されませんでした".into());
@@ -649,10 +688,11 @@ impl App {
                     }
 
                     let worker_id = worker.snapshot.id;
-                    match self
-                        .manager
-                        .continue_worker(worker_id, trimmed.to_string(), permission_mode.clone())
-                    {
+                    match self.manager.continue_worker(
+                        worker_id,
+                        trimmed.to_string(),
+                        permission_mode.clone(),
+                    ) {
                         Ok(_) => {
                             let mode_str = permission_mode_label(&permission_mode);
                             self.push_log(format!(
@@ -685,6 +725,122 @@ impl App {
             Err(err) => {
                 self.push_log(format!("自由指示の作成に失敗しました: {err}"));
             }
+        }
+    }
+
+    fn submit_permission_decision(&mut self, decision: PermissionDecision) {
+        if let Some(prompt) = self.permission_prompt.take() {
+            if let Err(err) = self.manager.respond_permission(
+                prompt.worker_id,
+                prompt.request.request_id,
+                decision,
+            ) {
+                self.push_log_with_worker(
+                    Some(&prompt.worker_name),
+                    format!("権限応答の送信に失敗しました: {err}"),
+                );
+            } else {
+                self.permission_tracker.insert(
+                    prompt.request.request_id,
+                    PermissionTrackerEntry {
+                        worker_name: prompt.worker_name,
+                        step_name: prompt.request.step_name.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn handle_permission_requested(&mut self, id: WorkerId, request: PermissionRequest) {
+        let worker_name = self
+            .worker_name_by_id(id)
+            .unwrap_or_else(|| format!("worker-{}", id.0));
+        let tools_text = Self::describe_allowed_tools(&request.allowed_tools);
+        let mode_text = permission_mode_label(&request.permission_mode).to_string();
+        let step_name = request.step_name.clone();
+
+        self.permission_prompt = Some(PermissionPromptState {
+            worker_id: id,
+            worker_name: worker_name.clone(),
+            request,
+            selection: PermissionDecision::Allow,
+        });
+
+        self.permission_tracker.insert(
+            self.permission_prompt
+                .as_ref()
+                .map(|prompt| prompt.request.request_id)
+                .unwrap(),
+            PermissionTrackerEntry {
+                worker_name: worker_name.clone(),
+                step_name: step_name.clone(),
+            },
+        );
+
+        self.add_worker_log(
+            id,
+            format!(
+                "権限確認待ち: ステップ='{}', ツール={}, モード={}",
+                step_name, tools_text, mode_text
+            ),
+        );
+
+        self.push_log_with_worker(
+            Some(&worker_name),
+            format!(
+                "ステップ '{}' の権限確認を受信しました (ツール: {}, モード: {})",
+                step_name, tools_text, mode_text
+            ),
+        );
+    }
+
+    fn handle_permission_resolved(
+        &mut self,
+        id: WorkerId,
+        request_id: u64,
+        decision: PermissionDecision,
+    ) {
+        if let Some(current) = self.permission_prompt.as_ref() {
+            if current.request.request_id == request_id {
+                self.permission_prompt = None;
+            }
+        }
+
+        let tracker = self.permission_tracker.remove(&request_id);
+        let worker_name = tracker
+            .as_ref()
+            .map(|entry| entry.worker_name.clone())
+            .or_else(|| self.worker_name_by_id(id))
+            .unwrap_or_else(|| format!("worker-{}", id.0));
+        let step_name = tracker.as_ref().map(|entry| entry.step_name.clone());
+
+        let action_text = match decision {
+            PermissionDecision::Allow => "許可",
+            PermissionDecision::Deny => "拒否",
+        };
+
+        let message = if let Some(step) = step_name.clone() {
+            format!("ステップ '{}' の権限を{}しました", step, action_text)
+        } else {
+            format!("権限リクエスト (#{}) を{}しました", request_id, action_text)
+        };
+
+        self.add_worker_log(id, message.clone());
+        self.push_log_with_worker(Some(&worker_name), message);
+    }
+
+    fn worker_name_by_id(&self, id: WorkerId) -> Option<String> {
+        self.workers
+            .iter()
+            .find(|view| view.snapshot.id == id)
+            .map(|view| view.snapshot.name.clone())
+    }
+
+    fn describe_allowed_tools(tools: &Option<Vec<String>>) -> String {
+        match tools {
+            None => "制限なし".to_string(),
+            Some(list) if list.is_empty() => "なし".to_string(),
+            Some(list) => list.join(", "),
         }
     }
 
@@ -785,6 +941,16 @@ impl App {
                     }
                     self.push_log(format!("エラー: {message}"));
                 }
+                WorkerEvent::PermissionRequested { id, request } => {
+                    self.handle_permission_requested(id, request);
+                }
+                WorkerEvent::PermissionResolved {
+                    id,
+                    request_id,
+                    decision,
+                } => {
+                    self.handle_permission_resolved(id, request_id, decision);
+                }
             }
         }
     }
@@ -811,10 +977,16 @@ impl App {
             self.render_modal(frame, 60, 50, "Help", self.help_lines());
         }
 
+        if let Some(prompt) = &self.permission_prompt {
+            self.render_permission_modal(frame, prompt);
+        }
+
         if let Some(input_mode) = &self.input_mode {
             match input_mode {
                 InputMode::FreePrompt {
-                    buffer, permission_mode, ..
+                    buffer,
+                    permission_mode,
+                    ..
                 } => {
                     self.render_prompt_modal(frame, buffer, permission_mode);
                 }
@@ -1084,7 +1256,12 @@ impl App {
         frame.render_widget(widget, area);
     }
 
-    fn render_prompt_modal(&self, frame: &mut ratatui::Frame<'_>, buffer: &str, permission_mode: &Option<String>) {
+    fn render_prompt_modal(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        buffer: &str,
+        permission_mode: &Option<String>,
+    ) {
         let area = centered_rect(70, 30, frame.area());
         let mode_str = permission_mode_label(permission_mode);
         let mode_color = match permission_mode.as_deref() {
@@ -1117,6 +1294,83 @@ impl App {
         let widget = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("Free Prompt"));
+        frame.render_widget(Clear, area);
+        frame.render_widget(widget, area);
+    }
+
+    fn render_permission_modal(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        prompt: &PermissionPromptState,
+    ) {
+        let area = centered_rect(70, 45, frame.area());
+        let mode_label = permission_mode_label(&prompt.request.permission_mode).to_string();
+        let tools_text = Self::describe_allowed_tools(&prompt.request.allowed_tools);
+        let description = prompt
+            .request
+            .description
+            .as_deref()
+            .unwrap_or("このステップに進む前に権限が必要です");
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![Span::styled(
+            "権限確認",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::raw("ワーカー: "),
+            Span::styled(&prompt.worker_name, Style::default().fg(Color::Cyan)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("ステップ: "),
+            Span::styled(&prompt.request.step_name, Style::default().fg(Color::Green)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("説明: "),
+            Span::raw(description),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("権限モード: "),
+            Span::styled(mode_label, Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("許可ツール: "),
+            Span::styled(tools_text, Style::default().fg(Color::Cyan)),
+        ]));
+        lines.push(Line::raw(""));
+
+        let options = [
+            (PermissionDecision::Allow, "許可する"),
+            (PermissionDecision::Deny, "拒否する"),
+        ];
+
+        let mut option_spans = Vec::new();
+        for (idx, (decision, label)) in options.iter().enumerate() {
+            if idx > 0 {
+                option_spans.push(Span::raw("    "));
+            }
+            let is_selected = *decision == prompt.selection;
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            option_spans.push(Span::styled(*label, style));
+        }
+        lines.push(Line::from(option_spans));
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("←/→ で切替 • Enter/ Y = 許可 • Esc/ N = 拒否"));
+
+        let widget = Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("Permission"));
+
         frame.render_widget(Clear, area);
         frame.render_widget(widget, area);
     }
@@ -1319,15 +1573,14 @@ impl App {
                     };
 
                     // Safe string truncation using chars instead of byte slicing
-                    let (summary_source, prefix) = if let Some(first_thought) =
-                        entry.thought_lines.first()
-                    {
-                        (first_thought.clone(), "🤔 ")
-                    } else if let Some(first_result) = entry.result_lines.first() {
-                        (first_result.clone(), "")
-                    } else {
-                        ("(no result)".to_string(), "")
-                    };
+                    let (summary_source, prefix) =
+                        if let Some(first_thought) = entry.thought_lines.first() {
+                            (first_thought.clone(), "🤔 ")
+                        } else if let Some(first_result) = entry.result_lines.first() {
+                            (first_result.clone(), "")
+                        } else {
+                            ("(no result)".to_string(), "")
+                        };
 
                     let summary_body = {
                         let chars: Vec<char> = summary_source.chars().collect();
@@ -1731,6 +1984,27 @@ enum InputMode {
         worktrees: Vec<ExistingWorktree>,
         selected: usize,
     },
+}
+
+struct PermissionPromptState {
+    worker_id: WorkerId,
+    worker_name: String,
+    request: PermissionRequest,
+    selection: PermissionDecision,
+}
+
+impl PermissionPromptState {
+    fn toggle(&mut self) {
+        self.selection = match self.selection {
+            PermissionDecision::Allow => PermissionDecision::Deny,
+            PermissionDecision::Deny => PermissionDecision::Allow,
+        };
+    }
+}
+
+struct PermissionTrackerEntry {
+    worker_name: String,
+    step_name: String,
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

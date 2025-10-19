@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -88,6 +88,16 @@ pub enum WorkerCommand {
     Persist {
         id: WorkerId,
     },
+    PermissionPrompt {
+        id: WorkerId,
+        request: PermissionRequest,
+        respond_to: Sender<PermissionDecision>,
+    },
+    PermissionResponse {
+        id: WorkerId,
+        request_id: u64,
+        decision: PermissionDecision,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +116,33 @@ pub enum WorkerEvent {
         id: Option<WorkerId>,
         message: String,
     },
+    PermissionRequested {
+        id: WorkerId,
+        request: PermissionRequest,
+    },
+    PermissionResolved {
+        id: WorkerId,
+        request_id: u64,
+        decision: PermissionDecision,
+    },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Debug)]
+pub struct PermissionRequest {
+    pub request_id: u64,
+    pub step_name: String,
+    pub description: Option<String>,
+    pub permission_mode: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+static NEXT_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct WorkerHandle {
@@ -132,7 +168,12 @@ impl WorkerHandle {
             .map_err(|err| anyhow!("failed to enqueue worker restart: {err}"))
     }
 
-    pub fn continue_worker(&self, id: WorkerId, prompt: String, permission_mode: Option<String>) -> Result<()> {
+    pub fn continue_worker(
+        &self,
+        id: WorkerId,
+        prompt: String,
+        permission_mode: Option<String>,
+    ) -> Result<()> {
         self.cmd_tx
             .send(WorkerCommand::Continue {
                 id,
@@ -140,6 +181,21 @@ impl WorkerHandle {
                 permission_mode,
             })
             .map_err(|err| anyhow!("failed to enqueue worker continuation: {err}"))
+    }
+
+    pub fn respond_permission(
+        &self,
+        id: WorkerId,
+        request_id: u64,
+        decision: PermissionDecision,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(WorkerCommand::PermissionResponse {
+                id,
+                request_id,
+                decision,
+            })
+            .map_err(|err| anyhow!("failed to enqueue permission response: {err}"))
     }
 }
 
@@ -183,6 +239,12 @@ struct WorkerManager {
     evt_tx: Sender<WorkerEvent>,
     next_id: usize,
     workers: HashMap<WorkerId, WorkerRuntime>,
+    pending_permissions: HashMap<u64, PendingPermission>,
+}
+
+struct PendingPermission {
+    worker_id: WorkerId,
+    respond_to: Sender<PermissionDecision>,
 }
 
 impl WorkerManager {
@@ -204,6 +266,7 @@ impl WorkerManager {
             evt_tx,
             next_id,
             workers: HashMap::new(),
+            pending_permissions: HashMap::new(),
         }
     }
 
@@ -347,6 +410,20 @@ impl WorkerManager {
                 }
                 WorkerCommand::Persist { id } => {
                     self.persist_worker(id);
+                }
+                WorkerCommand::PermissionPrompt {
+                    id,
+                    request,
+                    respond_to,
+                } => {
+                    self.handle_permission_prompt(id, request, respond_to);
+                }
+                WorkerCommand::PermissionResponse {
+                    id,
+                    request_id,
+                    decision,
+                } => {
+                    self.handle_permission_response(id, request_id, decision);
                 }
             }
         }
@@ -572,10 +649,14 @@ impl WorkerManager {
             eprintln!("Failed to delete worker state {}: {err}", snapshot.name);
         }
 
+        self.cancel_pending_permissions_for_worker(id);
+
         Ok(())
     }
 
     fn handle_restart(&mut self, id: WorkerId) -> Result<()> {
+        self.cancel_pending_permissions_for_worker(id);
+
         let runtime = self
             .workers
             .get_mut(&id)
@@ -601,7 +682,14 @@ impl WorkerManager {
         Ok(())
     }
 
-    fn handle_continue(&mut self, id: WorkerId, prompt: String, permission_mode: Option<String>) -> Result<()> {
+    fn handle_continue(
+        &mut self,
+        id: WorkerId,
+        prompt: String,
+        permission_mode: Option<String>,
+    ) -> Result<()> {
+        self.cancel_pending_permissions_for_worker(id);
+
         let runtime = self
             .workers
             .get_mut(&id)
@@ -653,6 +741,61 @@ impl WorkerManager {
         Ok(())
     }
 
+    fn handle_permission_prompt(
+        &mut self,
+        id: WorkerId,
+        request: PermissionRequest,
+        respond_to: Sender<PermissionDecision>,
+    ) {
+        self.pending_permissions.insert(
+            request.request_id,
+            PendingPermission {
+                worker_id: id,
+                respond_to,
+            },
+        );
+
+        let _ = self
+            .evt_tx
+            .send(WorkerEvent::PermissionRequested { id, request });
+    }
+
+    fn handle_permission_response(
+        &mut self,
+        id: WorkerId,
+        request_id: u64,
+        decision: PermissionDecision,
+    ) {
+        if let Some(pending) = self.pending_permissions.remove(&request_id) {
+            let _ = pending.respond_to.send(decision);
+            let _ = self.evt_tx.send(WorkerEvent::PermissionResolved {
+                id,
+                request_id,
+                decision,
+            });
+        } else {
+            let _ = self.evt_tx.send(WorkerEvent::Error {
+                id: Some(id),
+                message: format!("permission request {} not found", request_id),
+            });
+        }
+    }
+
+    fn cancel_pending_permissions_for_worker(&mut self, id: WorkerId) {
+        let mut orphaned = Vec::new();
+        for (request_id, pending) in self.pending_permissions.iter() {
+            if pending.worker_id == id {
+                orphaned.push(*request_id);
+            }
+        }
+
+        for request_id in orphaned {
+            if let Some(pending) = self.pending_permissions.remove(&request_id) {
+                let _ = pending.respond_to.send(PermissionDecision::Deny);
+            }
+        }
+    }
+
     fn shutdown_all(&mut self) {
         // Persist all workers before shutting down
         for id in self.workers.keys().copied().collect::<Vec<_>>() {
@@ -662,6 +805,10 @@ impl WorkerManager {
         // Then stop all workers
         for (_, mut runtime) in self.workers.drain() {
             runtime.stop_agent();
+        }
+
+        for (_, pending) in self.pending_permissions.drain() {
+            let _ = pending.respond_to.send(PermissionDecision::Deny);
         }
     }
 
@@ -913,6 +1060,82 @@ fn agent_simulation(
         send_log(format!("[{}] {}", step.name, step_desc), worker_id);
 
         let result = if let Some(claude_cfg) = &step.claude {
+            let request_id = NEXT_PERMISSION_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
+            let permission_request = PermissionRequest {
+                request_id,
+                step_name: step.name.clone(),
+                description: step.description.clone(),
+                permission_mode: claude_cfg.permission_mode.clone(),
+                allowed_tools: claude_cfg.allowed_tools.clone(),
+            };
+
+            let (perm_tx, perm_rx) = mpsc::channel();
+            if let Err(err) = cmd_tx.send(WorkerCommand::PermissionPrompt {
+                id: worker_id,
+                request: permission_request.clone(),
+                respond_to: perm_tx,
+            }) {
+                send_log(
+                    format!("権限要求をエンキューできませんでした: {err}"),
+                    worker_id,
+                );
+                if let Ok(mut snapshot) = state.lock() {
+                    snapshot.status = WorkerStatus::Failed;
+                    snapshot.last_event = "権限要求の送信に失敗しました".into();
+                    snapshot.current_step = None;
+                    let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+                }
+                return;
+            }
+
+            if let Ok(mut snapshot) = state.lock() {
+                snapshot.last_event = format!("ステップ '{}' の権限確認を待機中", step.name);
+                let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+            }
+
+            let tools_label = describe_allowed_tools(permission_request.allowed_tools.as_ref());
+
+            send_log(
+                format!(
+                    "権限確認待ち (request #{}, tools: {})",
+                    permission_request.request_id, tools_label
+                ),
+                worker_id,
+            );
+
+            match perm_rx.recv() {
+                Ok(PermissionDecision::Allow) => {
+                    send_log("権限が承認されました".to_string(), worker_id);
+                }
+                Ok(PermissionDecision::Deny) => {
+                    send_log(
+                        "権限が拒否されました。ステップを中断します".to_string(),
+                        worker_id,
+                    );
+                    if let Ok(mut snapshot) = state.lock() {
+                        snapshot.status = WorkerStatus::Paused;
+                        snapshot.last_event =
+                            format!("ステップ '{}' の権限が拒否されました", step.name);
+                        snapshot.current_step = None;
+                        let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+                    }
+                    return;
+                }
+                Err(_) => {
+                    send_log(
+                        "権限確認中に内部エラーが発生したため中断します".to_string(),
+                        worker_id,
+                    );
+                    if let Ok(mut snapshot) = state.lock() {
+                        snapshot.status = WorkerStatus::Failed;
+                        snapshot.last_event = "権限確認中にエラーが発生".into();
+                        snapshot.current_step = None;
+                        let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+                    }
+                    return;
+                }
+            }
+
             let prompt = render_prompt(&claude_cfg.prompt, &snapshot_info);
 
             // Prompt section
@@ -1154,15 +1377,14 @@ fn run_claude_command(
 
         // Try to parse as JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            let thought_lines = extract_thinking_lines(&json);
+            if !thought_lines.is_empty() {
+                lines.push("[THOUGHT_START]".to_string());
+                lines.extend(thought_lines);
+                lines.push("[THOUGHT_END]".to_string());
+            }
+
             match json.get("type").and_then(|v| v.as_str()) {
-                Some("thinking") => {
-                    let thought_lines = extract_text_lines(&json);
-                    if !thought_lines.is_empty() {
-                        lines.push("[THOUGHT_START]".to_string());
-                        lines.extend(thought_lines);
-                        lines.push("[THOUGHT_END]".to_string());
-                    }
-                }
                 Some("system") => {
                     // Session initialization - extract session_id but don't log
                     if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
@@ -1195,7 +1417,7 @@ fn run_claude_command(
                     }
                 }
                 _ => {
-                    // Ignore other event types (assistant, tool_use, thinking, etc.)
+                    // Ignore other event types (assistant, tool_use, etc.)
                 }
             }
         }
@@ -1246,35 +1468,59 @@ fn run_claude_command(
     Ok((lines, extracted_session_id))
 }
 
-fn extract_text_lines(json: &serde_json::Value) -> Vec<String> {
-    fn collect(value: &serde_json::Value, acc: &mut Vec<String>) {
+fn extract_thinking_lines(json: &serde_json::Value) -> Vec<String> {
+    fn walk(value: &serde_json::Value, acc: &mut Vec<String>, in_thinking: bool) {
         match value {
             serde_json::Value::String(text) => {
-                for line in text.lines() {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        continue;
+                if in_thinking {
+                    for line in text.lines() {
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        acc.push(trimmed.to_string());
                     }
-                    acc.push(trimmed.to_string());
                 }
             }
             serde_json::Value::Array(items) => {
                 for item in items {
-                    collect(item, acc);
+                    walk(item, acc, in_thinking);
                 }
             }
             serde_json::Value::Object(map) => {
+                let mut next_flag = in_thinking;
+                if let Some(ty) = map.get("type").and_then(|v| v.as_str()) {
+                    let ty_lc = ty.to_ascii_lowercase();
+                    if matches!(
+                        ty_lc.as_str(),
+                        "thinking" | "analysis" | "plan" | "reasoning"
+                    ) {
+                        next_flag = true;
+                    }
+                }
+
+                if let Some(thinking) = map.get("thinking") {
+                    walk(thinking, acc, true);
+                }
+
                 if let Some(text) = map.get("text") {
-                    collect(text, acc);
+                    walk(text, acc, next_flag);
                 }
-                if let Some(content) = map.get("thinking") {
-                    collect(content, acc);
-                }
+
                 if let Some(content) = map.get("content") {
-                    collect(content, acc);
+                    walk(content, acc, next_flag);
                 }
+
                 if let Some(message) = map.get("message") {
-                    collect(message, acc);
+                    walk(message, acc, next_flag);
+                }
+
+                for (key, value) in map {
+                    if matches!(key.as_str(), "thinking" | "analysis" | "reasoning" | "plan") {
+                        walk(value, acc, true);
+                    } else if !matches!(key.as_str(), "text" | "content" | "message") {
+                        walk(value, acc, next_flag);
+                    }
                 }
             }
             _ => {}
@@ -1282,21 +1528,7 @@ fn extract_text_lines(json: &serde_json::Value) -> Vec<String> {
     }
 
     let mut acc = Vec::new();
-
-    if let Some(text) = json.get("text") {
-        collect(text, &mut acc);
-    }
-    if let Some(thinking) = json.get("thinking") {
-        collect(thinking, &mut acc);
-    }
-    if let Some(content) = json.get("content") {
-        collect(content, &mut acc);
-    }
-
-    if acc.is_empty() {
-        collect(json, &mut acc);
-    }
-
+    walk(json, &mut acc, false);
     acc
 }
 
@@ -1309,6 +1541,14 @@ fn render_prompt(template: &str, snapshot: &WorkerSnapshot) -> String {
         .replace("{{worker}}", snapshot.name.as_str())
         .replace("{{branch}}", snapshot.branch.as_str())
         .replace("{{worktree}}", snapshot.worktree.as_str())
+}
+
+fn describe_allowed_tools(tools: Option<&Vec<String>>) -> String {
+    match tools {
+        None => "制限なし".to_string(),
+        Some(list) if list.is_empty() => "なし".to_string(),
+        Some(list) => list.join(", "),
+    }
 }
 
 fn determine_base_ref(repo_root: &Path) -> Option<String> {
