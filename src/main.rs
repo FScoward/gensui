@@ -358,6 +358,12 @@ impl App {
             self.log_scroll = 0;
             self.log_view_mode = LogViewMode::Overview;
             self.selected_step = 0;
+            // Clamp selected_step to valid range
+            if let Some(view) = self.selected_worker_view() {
+                if !view.structured_logs.is_empty() {
+                    self.selected_step = self.selected_step.min(view.structured_logs.len() - 1);
+                }
+            }
         }
     }
 
@@ -366,7 +372,8 @@ impl App {
     }
 
     fn scroll_log_down(&mut self) {
-        if self.log_scroll < self.log_messages.len().saturating_sub(1) {
+        let max_scroll = self.get_log_max_scroll();
+        if self.log_scroll < max_scroll {
             self.log_scroll += 1;
         }
     }
@@ -376,7 +383,7 @@ impl App {
     }
 
     fn scroll_log_end(&mut self) {
-        self.log_scroll = self.log_messages.len().saturating_sub(1);
+        self.log_scroll = self.get_log_max_scroll();
     }
 
     fn scroll_log_page_up(&mut self) {
@@ -385,7 +392,20 @@ impl App {
 
     fn scroll_log_page_down(&mut self) {
         let new_scroll = self.log_scroll.saturating_add(10);
-        self.log_scroll = new_scroll.min(self.log_messages.len().saturating_sub(1));
+        self.log_scroll = new_scroll.min(self.get_log_max_scroll());
+    }
+
+    fn get_log_max_scroll(&self) -> usize {
+        match self.log_view_mode {
+            LogViewMode::Raw => self.log_messages.len().saturating_sub(1),
+            _ => {
+                if let Some(view) = self.selected_worker_view() {
+                    view.logs.len().saturating_sub(1)
+                } else {
+                    self.log_messages.len().saturating_sub(1)
+                }
+            }
+        }
     }
 
     fn compact_logs(&mut self) {
@@ -396,20 +416,46 @@ impl App {
     }
 
     fn switch_log_tab_next(&mut self) {
-        self.log_view_mode = match self.log_view_mode {
+        let next_mode = match self.log_view_mode {
             LogViewMode::Overview => LogViewMode::Detail,
             LogViewMode::Detail => LogViewMode::Raw,
             LogViewMode::Raw => LogViewMode::Overview,
         };
+
+        // Only switch to Detail if a valid step is available
+        if matches!(next_mode, LogViewMode::Detail) {
+            if let Some(view) = self.selected_worker_view() {
+                if !view.structured_logs.is_empty() {
+                    // Clamp selected_step to valid range
+                    self.selected_step = self.selected_step.min(view.structured_logs.len() - 1);
+                    self.log_view_mode = next_mode;
+                }
+            }
+        } else {
+            self.log_view_mode = next_mode;
+        }
         self.log_scroll = 0;
     }
 
     fn switch_log_tab_prev(&mut self) {
-        self.log_view_mode = match self.log_view_mode {
+        let next_mode = match self.log_view_mode {
             LogViewMode::Overview => LogViewMode::Raw,
             LogViewMode::Raw => LogViewMode::Detail,
             LogViewMode::Detail => LogViewMode::Overview,
         };
+
+        // Only switch to Detail if a valid step is available
+        if matches!(next_mode, LogViewMode::Detail) {
+            if let Some(view) = self.selected_worker_view() {
+                if !view.structured_logs.is_empty() {
+                    // Clamp selected_step to valid range
+                    self.selected_step = self.selected_step.min(view.structured_logs.len() - 1);
+                    self.log_view_mode = next_mode;
+                }
+            }
+        } else {
+            self.log_view_mode = next_mode;
+        }
         self.log_scroll = 0;
     }
 
@@ -419,14 +465,21 @@ impl App {
 
     fn select_step_down(&mut self) {
         if let Some(view) = self.selected_worker_view() {
-            let max = view.structured_logs.len().saturating_sub(1);
-            self.selected_step = (self.selected_step + 1).min(max);
+            if !view.structured_logs.is_empty() {
+                let max = view.structured_logs.len() - 1;
+                self.selected_step = (self.selected_step + 1).min(max);
+            }
         }
     }
 
     fn enter_detail_from_overview(&mut self) {
-        self.log_view_mode = LogViewMode::Detail;
-        self.log_scroll = 0;
+        // Only enter detail if a valid step is selected
+        if let Some(view) = self.selected_worker_view() {
+            if self.selected_step < view.structured_logs.len() {
+                self.log_view_mode = LogViewMode::Detail;
+                self.log_scroll = 0;
+            }
+        }
     }
 
     fn back_to_overview(&mut self) {
@@ -531,16 +584,25 @@ impl App {
             return;
         }
         self.selected = (self.selected + 1).min(count.saturating_sub(1));
+        // Reset log view state when switching workers
+        self.selected_step = 0;
+        self.log_scroll = 0;
     }
 
     fn select_previous(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
+            // Reset log view state when switching workers
+            self.selected_step = 0;
+            self.log_scroll = 0;
         }
     }
 
     fn select_first(&mut self) {
         self.selected = 0;
+        // Reset log view state when switching workers
+        self.selected_step = 0;
+        self.log_scroll = 0;
     }
 
     fn select_last(&mut self) {
@@ -550,6 +612,9 @@ impl App {
         } else {
             self.selected = count - 1;
         }
+        // Reset log view state when switching workers
+        self.selected_step = 0;
+        self.log_scroll = 0;
     }
 
     fn on_tick(&mut self) {
@@ -891,7 +956,7 @@ impl App {
         };
 
         let total_lines = all_lines.len();
-        let visible_start = self.log_scroll;
+        let visible_start = self.log_scroll.min(total_lines.saturating_sub(1));
 
         // Show lines from scroll position onwards
         let visible_lines: Vec<Line<'static>> = all_lines
@@ -948,7 +1013,8 @@ impl App {
 
             let rows: Vec<Row> = entries
                 .iter()
-                .map(|entry| {
+                .enumerate()
+                .map(|(idx, entry)| {
                     let status_str = match entry.status {
                         StepStatus::Running => "Running",
                         StepStatus::Success => "✓ Success",
@@ -967,7 +1033,7 @@ impl App {
                         })
                         .unwrap_or_else(|| "(no result)".to_string());
 
-                    let style = if entry.step_index == self.selected_step {
+                    let style = if idx == self.selected_step {
                         Style::default().bg(Color::DarkGray)
                     } else {
                         Style::default()
@@ -1136,10 +1202,16 @@ impl App {
 
     fn clamp_selection(&mut self) {
         let count = self.visible_indices().len();
+        let old_selected = self.selected;
         if count == 0 {
             self.selected = 0;
         } else if self.selected >= count {
             self.selected = count - 1;
+        }
+        // Reset log view state if worker selection changed
+        if old_selected != self.selected {
+            self.selected_step = 0;
+            self.log_scroll = 0;
         }
     }
 

@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -69,6 +69,7 @@ pub enum WorkerCommand {
     Delete { id: WorkerId },
     Restart { id: WorkerId },
     Continue { id: WorkerId, prompt: String },
+    Persist { id: WorkerId },
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +138,7 @@ pub fn spawn_worker_system(
         repo_root,
         config,
         state_store,
+        cmd_tx.clone(),
         cmd_rx,
         evt_tx.clone(),
         next_id,
@@ -154,6 +156,7 @@ struct WorkerManager {
     repo_root: PathBuf,
     config: Config,
     state_store: StateStore,
+    cmd_tx: Sender<WorkerCommand>,
     cmd_rx: Receiver<WorkerCommand>,
     evt_tx: Sender<WorkerEvent>,
     next_id: usize,
@@ -165,6 +168,7 @@ impl WorkerManager {
         repo_root: PathBuf,
         config: Config,
         state_store: StateStore,
+        cmd_tx: Sender<WorkerCommand>,
         cmd_rx: Receiver<WorkerCommand>,
         evt_tx: Sender<WorkerEvent>,
         next_id: usize,
@@ -173,6 +177,7 @@ impl WorkerManager {
             repo_root,
             config,
             state_store,
+            cmd_tx,
             cmd_rx,
             evt_tx,
             next_id,
@@ -232,9 +237,10 @@ impl WorkerManager {
                     worktree_path,
                     record.snapshot.branch.clone(),
                     record.workflow,
+                    self.cmd_tx.clone(),
                 ) {
-                    Ok(mut runtime) => {
-                        runtime.completed_steps = record.completed_steps;
+                    Ok(runtime) => {
+                        runtime.completed_steps.store(record.completed_steps, Ordering::SeqCst);
 
                         // Restore logs to runtime
                         for log_line in &record.logs {
@@ -310,6 +316,9 @@ impl WorkerManager {
                             message: err.to_string(),
                         });
                     }
+                }
+                WorkerCommand::Persist { id } => {
+                    self.persist_worker(id);
                 }
             }
         }
@@ -406,7 +415,7 @@ impl WorkerManager {
             session_id: None,
         };
 
-        let runtime = WorkerRuntime::new(snapshot, worktree_path, branch, workflow);
+        let runtime = WorkerRuntime::new(snapshot, worktree_path, branch, workflow, self.cmd_tx.clone());
         let mut runtime = match runtime {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -525,7 +534,7 @@ impl WorkerManager {
         runtime.stop_agent();
 
         // Reset completed steps to restart from beginning
-        runtime.completed_steps = 0;
+        runtime.completed_steps.store(0, Ordering::SeqCst);
 
         {
             let mut snapshot = runtime.state.lock().expect("worker snapshot poisoned");
@@ -552,7 +561,7 @@ impl WorkerManager {
         runtime.stop_agent();
 
         // Mark all current steps as completed
-        runtime.completed_steps = runtime.workflow.steps.len();
+        runtime.completed_steps.store(runtime.workflow.steps.len(), Ordering::SeqCst);
 
         // Create a new workflow step with the continuation prompt
         let continue_step = WorkflowStep {
@@ -636,7 +645,7 @@ impl WorkerManager {
                 },
                 logs,
                 workflow: runtime.workflow.clone(),
-                completed_steps: runtime.completed_steps,
+                completed_steps: runtime.completed_steps.load(Ordering::SeqCst),
             };
 
             if let Err(err) = self.state_store.save_worker(&record) {
@@ -653,8 +662,9 @@ struct WorkerRuntime {
     worktree_path: PathBuf,
     branch: String,
     workflow: Workflow,
-    completed_steps: usize,
+    completed_steps: Arc<AtomicUsize>,
     logs: Arc<Mutex<VecDeque<String>>>,
+    cmd_tx: Sender<WorkerCommand>,
 }
 
 impl WorkerRuntime {
@@ -663,6 +673,7 @@ impl WorkerRuntime {
         worktree_path: PathBuf,
         branch: String,
         workflow: Workflow,
+        cmd_tx: Sender<WorkerCommand>,
     ) -> Result<Self> {
         Ok(Self {
             state: Arc::new(Mutex::new(snapshot)),
@@ -671,8 +682,9 @@ impl WorkerRuntime {
             worktree_path,
             branch,
             workflow,
-            completed_steps: 0,
+            completed_steps: Arc::new(AtomicUsize::new(0)),
             logs: Arc::new(Mutex::new(VecDeque::new())),
+            cmd_tx,
         })
     }
 
@@ -706,12 +718,13 @@ impl WorkerRuntime {
         let evt_tx = evt_tx.clone();
         let worktree_path = self.worktree_path.clone();
         let workflow = self.workflow.clone();
-        let start_step = self.completed_steps;
+        let completed_steps = Arc::clone(&self.completed_steps);
         let logs = Arc::clone(&self.logs);
+        let cmd_tx = self.cmd_tx.clone();
 
         let handle = thread::Builder::new()
             .name(format!("gensui-agent-{}", self.snapshot().name))
-            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow, start_step, logs))
+            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow, completed_steps, logs, cmd_tx))
             .expect("failed to spawn agent simulation");
 
         self.handle = Some(handle);
@@ -731,8 +744,9 @@ fn agent_simulation(
     worktree_path: PathBuf,
     evt_tx: Sender<WorkerEvent>,
     workflow: Workflow,
-    start_step: usize,
+    completed_steps: Arc<AtomicUsize>,
     logs: Arc<Mutex<VecDeque<String>>>,
+    cmd_tx: Sender<WorkerCommand>,
 ) {
     // Helper function to save log and send event
     let send_log = |line: String, worker_id: WorkerId| {
@@ -770,6 +784,8 @@ fn agent_simulation(
         }
         return;
     }
+
+    let start_step = completed_steps.load(Ordering::SeqCst);
 
     if start_step == 0 {
         if let Ok(mut snapshot) = state.lock() {
@@ -875,6 +891,12 @@ fn agent_simulation(
                 send_log("[RESULT_END]".to_string(), worker_id);
                 // Step end marker (success)
                 send_log("[STEP_END:Success]".to_string(), worker_id);
+
+                // Increment completed steps
+                completed_steps.fetch_add(1, Ordering::SeqCst);
+
+                // Persist the worker state to disk
+                let _ = cmd_tx.send(WorkerCommand::Persist { id: worker_id });
             }
             Err(err) => {
                 send_log(format!("Error: {err}"), worker_id);
