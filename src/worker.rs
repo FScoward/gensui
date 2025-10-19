@@ -63,7 +63,7 @@ pub struct CreateWorkerRequest {
     pub workflow: Option<String>,
     pub free_prompt: Option<String>,
     pub existing_worktree: Option<(PathBuf, String)>, // (worktree_path, branch_name)
-    pub plan_mode: Option<bool>,
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +83,7 @@ pub enum WorkerCommand {
     Continue {
         id: WorkerId,
         prompt: String,
-        plan_mode: bool,
+        permission_mode: Option<String>,
     },
     Persist {
         id: WorkerId,
@@ -132,12 +132,12 @@ impl WorkerHandle {
             .map_err(|err| anyhow!("failed to enqueue worker restart: {err}"))
     }
 
-    pub fn continue_worker(&self, id: WorkerId, prompt: String, plan_mode: bool) -> Result<()> {
+    pub fn continue_worker(&self, id: WorkerId, prompt: String, permission_mode: Option<String>) -> Result<()> {
         self.cmd_tx
             .send(WorkerCommand::Continue {
                 id,
                 prompt,
-                plan_mode,
+                permission_mode,
             })
             .map_err(|err| anyhow!("failed to enqueue worker continuation: {err}"))
     }
@@ -336,9 +336,9 @@ impl WorkerManager {
                 WorkerCommand::Continue {
                     id,
                     prompt,
-                    plan_mode,
+                    permission_mode,
                 } => {
-                    if let Err(err) = self.handle_continue(id, prompt, plan_mode) {
+                    if let Err(err) = self.handle_continue(id, prompt, permission_mode) {
                         let _ = self.evt_tx.send(WorkerEvent::Error {
                             id: Some(id),
                             message: err.to_string(),
@@ -411,19 +411,7 @@ impl WorkerManager {
             };
 
         let workflow = if let Some(prompt) = request.free_prompt.clone() {
-            let plan_mode_value = request.plan_mode.unwrap_or(false);
-            eprintln!(
-                "[DEBUG] CreateWorkerRequest.plan_mode: {:?}, evaluated to: {}",
-                request.plan_mode, plan_mode_value
-            );
-
-            let permission_mode = if plan_mode_value {
-                eprintln!("[DEBUG] Setting permission_mode to 'plan'");
-                Some("plan".to_string())
-            } else {
-                eprintln!("[DEBUG] Setting permission_mode to None (normal mode)");
-                None
-            };
+            let permission_mode = request.permission_mode.clone();
 
             Workflow {
                 name: format!("free-form-{}", worker_id.0),
@@ -613,7 +601,7 @@ impl WorkerManager {
         Ok(())
     }
 
-    fn handle_continue(&mut self, id: WorkerId, prompt: String, plan_mode: bool) -> Result<()> {
+    fn handle_continue(&mut self, id: WorkerId, prompt: String, permission_mode: Option<String>) -> Result<()> {
         let runtime = self
             .workers
             .get_mut(&id)
@@ -635,11 +623,7 @@ impl WorkerManager {
                 prompt,
                 model: None,
                 allowed_tools: None,
-                permission_mode: if plan_mode {
-                    Some("plan".to_string())
-                } else {
-                    None
-                },
+                permission_mode,
                 extra_args: None,
             }),
             description: Some("User follow-up instruction".to_string()),
@@ -1171,6 +1155,14 @@ fn run_claude_command(
         // Try to parse as JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
             match json.get("type").and_then(|v| v.as_str()) {
+                Some("thinking") => {
+                    let thought_lines = extract_text_lines(&json);
+                    if !thought_lines.is_empty() {
+                        lines.push("[THOUGHT_START]".to_string());
+                        lines.extend(thought_lines);
+                        lines.push("[THOUGHT_END]".to_string());
+                    }
+                }
                 Some("system") => {
                     // Session initialization - extract session_id but don't log
                     if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
@@ -1252,6 +1244,60 @@ fn run_claude_command(
     }
 
     Ok((lines, extracted_session_id))
+}
+
+fn extract_text_lines(json: &serde_json::Value) -> Vec<String> {
+    fn collect(value: &serde_json::Value, acc: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => {
+                for line in text.lines() {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    acc.push(trimmed.to_string());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect(item, acc);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(text) = map.get("text") {
+                    collect(text, acc);
+                }
+                if let Some(content) = map.get("thinking") {
+                    collect(content, acc);
+                }
+                if let Some(content) = map.get("content") {
+                    collect(content, acc);
+                }
+                if let Some(message) = map.get("message") {
+                    collect(message, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut acc = Vec::new();
+
+    if let Some(text) = json.get("text") {
+        collect(text, &mut acc);
+    }
+    if let Some(thinking) = json.get("thinking") {
+        collect(thinking, &mut acc);
+    }
+    if let Some(content) = json.get("content") {
+        collect(content, &mut acc);
+    }
+
+    if acc.is_empty() {
+        collect(json, &mut acc);
+    }
+
+    acc
 }
 
 fn render_prompt(template: &str, snapshot: &WorkerSnapshot) -> String {

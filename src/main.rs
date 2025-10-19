@@ -158,7 +158,7 @@ impl App {
                 InputMode::FreePrompt {
                     buffer,
                     force_new,
-                    plan_mode,
+                    permission_mode,
                 } => match key_event.code {
                     KeyCode::Esc => {
                         self.input_mode = None;
@@ -166,10 +166,10 @@ impl App {
                     KeyCode::Enter => {
                         let prompt = buffer.trim().to_string();
                         let is_force_new = *force_new;
-                        let is_plan_mode = *plan_mode;
+                        let mode = permission_mode.clone();
                         self.input_mode = None;
                         if !prompt.is_empty() {
-                            self.submit_free_prompt(prompt, is_force_new, is_plan_mode);
+                            self.submit_free_prompt(prompt, is_force_new, mode);
                         } else {
                             self.push_log("空の指示は送信されませんでした".into());
                         }
@@ -181,7 +181,13 @@ impl App {
                         buffer.push('\t');
                     }
                     KeyCode::Char('p') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        *plan_mode = !*plan_mode;
+                        // Cycle through: None -> "plan" -> "acceptEdits" -> None
+                        *permission_mode = match permission_mode.as_deref() {
+                            None => Some("plan".to_string()),
+                            Some("plan") => Some("acceptEdits".to_string()),
+                            Some("acceptEdits") => None,
+                            _ => None,
+                        };
                     }
                     KeyCode::Char(c) => {
                         if !key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -207,7 +213,7 @@ impl App {
                             self.input_mode = Some(InputMode::FreePrompt {
                                 buffer: String::new(),
                                 force_new: true,
-                                plan_mode: false,
+                                permission_mode: None,
                             });
                         } else {
                             // Use existing worktree
@@ -616,11 +622,11 @@ impl App {
         self.input_mode = Some(InputMode::FreePrompt {
             buffer: String::new(),
             force_new: false,
-            plan_mode: false,
+            permission_mode: None,
         });
     }
 
-    fn submit_free_prompt(&mut self, prompt: String, force_new: bool, plan_mode: bool) {
+    fn submit_free_prompt(&mut self, prompt: String, force_new: bool, permission_mode: Option<String>) {
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
             self.push_log("空の指示は送信されませんでした".into());
@@ -645,12 +651,13 @@ impl App {
                     let worker_id = worker.snapshot.id;
                     match self
                         .manager
-                        .continue_worker(worker_id, trimmed.to_string(), plan_mode)
+                        .continue_worker(worker_id, trimmed.to_string(), permission_mode.clone())
                     {
                         Ok(_) => {
+                            let mode_str = permission_mode_label(&permission_mode);
                             self.push_log(format!(
-                                "追加指示を送信しました (worker-{}): {}",
-                                worker_id.0, trimmed
+                                "追加指示を送信しました (worker-{}, {}): {}",
+                                worker_id.0, mode_str, trimmed
                             ));
                         }
                         Err(err) => {
@@ -665,15 +672,11 @@ impl App {
         // No worker selected or force_new is true - create new worker
         let mut request = CreateWorkerRequest::default();
         request.free_prompt = Some(trimmed.to_string());
-        request.plan_mode = Some(plan_mode);
+        request.permission_mode = permission_mode.clone();
 
         match self.manager.create_worker(request) {
             Ok(_) => {
-                let mode_str = if plan_mode {
-                    "プランモード"
-                } else {
-                    "通常モード"
-                };
+                let mode_str = permission_mode_label(&permission_mode);
                 self.push_log(format!(
                     "自由指示を送信しました ({}): {}",
                     mode_str, trimmed
@@ -811,9 +814,9 @@ impl App {
         if let Some(input_mode) = &self.input_mode {
             match input_mode {
                 InputMode::FreePrompt {
-                    buffer, plan_mode, ..
+                    buffer, permission_mode, ..
                 } => {
-                    self.render_prompt_modal(frame, buffer, *plan_mode);
+                    self.render_prompt_modal(frame, buffer, permission_mode);
                 }
                 InputMode::CreateWorkerSelection { selected } => {
                     self.render_create_selection_modal(frame, *selected);
@@ -1081,14 +1084,14 @@ impl App {
         frame.render_widget(widget, area);
     }
 
-    fn render_prompt_modal(&self, frame: &mut ratatui::Frame<'_>, buffer: &str, plan_mode: bool) {
+    fn render_prompt_modal(&self, frame: &mut ratatui::Frame<'_>, buffer: &str, permission_mode: &Option<String>) {
         let area = centered_rect(70, 30, frame.area());
-        let mode_str = if plan_mode {
-            "プランモード"
-        } else {
-            "通常モード"
+        let mode_str = permission_mode_label(permission_mode);
+        let mode_color = match permission_mode.as_deref() {
+            Some("plan") => Color::Cyan,
+            Some("acceptEdits") => Color::Yellow,
+            _ => Color::Green,
         };
-        let mode_color = if plan_mode { Color::Cyan } else { Color::Green };
 
         let lines = vec![
             Line::raw(
@@ -1316,19 +1319,26 @@ impl App {
                     };
 
                     // Safe string truncation using chars instead of byte slicing
-                    let summary = entry
-                        .result_lines
-                        .first()
-                        .map(|s| {
-                            let chars: Vec<char> = s.chars().collect();
-                            if chars.len() > 60 {
-                                let truncated: String = chars.iter().take(60).collect();
-                                format!("{}...", truncated)
-                            } else {
-                                s.clone()
-                            }
-                        })
-                        .unwrap_or_else(|| "(no result)".to_string());
+                    let (summary_source, prefix) = if let Some(first_thought) =
+                        entry.thought_lines.first()
+                    {
+                        (first_thought.clone(), "🤔 ")
+                    } else if let Some(first_result) = entry.result_lines.first() {
+                        (first_result.clone(), "")
+                    } else {
+                        ("(no result)".to_string(), "")
+                    };
+
+                    let summary_body = {
+                        let chars: Vec<char> = summary_source.chars().collect();
+                        if chars.len() > 60 {
+                            let truncated: String = chars.iter().take(60).collect();
+                            format!("{}...", truncated)
+                        } else {
+                            summary_source
+                        }
+                    };
+                    let summary = format!("{}{}", prefix, summary_body);
 
                     let style = if idx == safe_selected_step {
                         Style::default().bg(Color::DarkGray)
@@ -1394,6 +1404,17 @@ impl App {
                     lines.push(Line::from(line.clone()));
                 }
                 lines.push(Line::raw(""));
+
+                if !entry.thought_lines.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "─── Thought ───",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    for line in &entry.thought_lines {
+                        lines.push(Line::from(line.clone()));
+                    }
+                    lines.push(Line::raw(""));
+                }
 
                 // Result section
                 lines.push(Line::from(Span::styled(
@@ -1549,8 +1570,10 @@ struct WorkerView {
     current_step_name: Option<String>,
     current_prompt: Vec<String>,
     current_result: Vec<String>,
+    current_thought: Vec<String>,
     in_prompt: bool,
     in_result: bool,
+    in_thought: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1559,6 +1582,7 @@ struct LogEntry {
     step_name: String,
     prompt_lines: Vec<String>,
     result_lines: Vec<String>,
+    thought_lines: Vec<String>,
     status: StepStatus,
 }
 
@@ -1588,8 +1612,10 @@ impl WorkerView {
             current_step_name: None,
             current_prompt: Vec::new(),
             current_result: Vec::new(),
+            current_thought: Vec::new(),
             in_prompt: false,
             in_result: false,
+            in_thought: false,
         }
     }
 
@@ -1621,19 +1647,32 @@ impl WorkerView {
                         self.current_step_name = Some(parts[1].to_string());
                         self.current_prompt.clear();
                         self.current_result.clear();
+                        self.current_thought.clear();
+                        self.in_prompt = false;
+                        self.in_result = false;
+                        self.in_thought = false;
                     }
                 }
             }
         } else if line == "[PROMPT_START]" {
             self.in_prompt = true;
             self.in_result = false;
+            self.in_thought = false;
         } else if line == "[PROMPT_END]" {
             self.in_prompt = false;
         } else if line == "[RESULT_START]" {
             self.in_prompt = false;
             self.in_result = true;
+            self.in_thought = false;
         } else if line == "[RESULT_END]" {
             self.in_result = false;
+        } else if line == "[THOUGHT_START]" {
+            self.in_prompt = false;
+            self.in_result = false;
+            self.in_thought = true;
+            self.current_thought.clear();
+        } else if line == "[THOUGHT_END]" {
+            self.in_thought = false;
         } else if line.starts_with("[STEP_END:") {
             // Finalize current step
             if let Some(content) = line
@@ -1653,6 +1692,7 @@ impl WorkerView {
                         step_name: name.clone(),
                         prompt_lines: self.current_prompt.clone(),
                         result_lines: self.current_result.clone(),
+                        thought_lines: self.current_thought.clone(),
                         status,
                     };
                     self.structured_logs.push(entry);
@@ -1662,6 +1702,8 @@ impl WorkerView {
                     self.current_step_name = None;
                     self.current_prompt.clear();
                     self.current_result.clear();
+                    self.current_thought.clear();
+                    self.in_thought = false;
                 }
             }
         } else if self.in_prompt && !line.starts_with("─") {
@@ -1670,6 +1712,8 @@ impl WorkerView {
         } else if self.in_result && !line.starts_with("─") {
             // Collect result lines (skip separator lines)
             self.current_result.push(line.to_string());
+        } else if self.in_thought {
+            self.current_thought.push(line.to_string());
         }
     }
 }
@@ -1678,7 +1722,7 @@ enum InputMode {
     FreePrompt {
         buffer: String,
         force_new: bool,
-        plan_mode: bool,
+        permission_mode: Option<String>,
     },
     CreateWorkerSelection {
         selected: usize,
@@ -1729,5 +1773,14 @@ fn status_color(status: WorkerStatus) -> Color {
         WorkerStatus::Failed => Color::Red,
         WorkerStatus::Idle => Color::Gray,
         WorkerStatus::Archived => Color::Blue,
+    }
+}
+
+fn permission_mode_label(permission_mode: &Option<String>) -> &str {
+    match permission_mode.as_deref() {
+        None => "通常モード",
+        Some("plan") => "プランモード",
+        Some("acceptEdits") => "編集承認モード",
+        Some(other) => other,
     }
 }

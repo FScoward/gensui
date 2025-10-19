@@ -24,7 +24,7 @@
     },
     {
       "name": "claude-analyze",
-      "description": "Claude Codeに分析を任せるサンプル",
+      "description": "Claude Codeに分析を任せるサンプル（プランモード）",
       "steps": [
         {
           "name": "Claude分析",
@@ -40,6 +40,27 @@
         {
           "name": "結果の確認",
           "command": "echo '[確認] Claudeの出力をレビューしてください'"
+        }
+      ]
+    },
+    {
+      "name": "claude-implement",
+      "description": "Claude Codeに実装を任せるサンプル（編集承認モード）",
+      "steps": [
+        {
+          "name": "実装",
+          "description": "Claude Codeに実装を任せる（編集を自動承認）",
+          "claude": {
+            "prompt": "Issue {{issue}} について実装してください。テストも含めて完全に動作するコードを書いてください。",
+            "model": "sonnet",
+            "permission_mode": "acceptEdits",
+            "allowed_tools": ["Read", "Write", "Edit", "Grep", "Glob"],
+            "extra_args": []
+          }
+        },
+        {
+          "name": "テスト実行",
+          "command": "echo '[テスト] 実装が完了しました。テストを実行してください。'"
         }
       ]
     }
