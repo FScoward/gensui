@@ -63,6 +63,7 @@ pub struct CreateWorkerRequest {
     pub workflow: Option<String>,
     pub free_prompt: Option<String>,
     pub existing_worktree: Option<(PathBuf, String)>, // (worktree_path, branch_name)
+    pub plan_mode: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,10 +74,20 @@ pub struct ExistingWorktree {
 
 pub enum WorkerCommand {
     Create(CreateWorkerRequest),
-    Delete { id: WorkerId },
-    Restart { id: WorkerId },
-    Continue { id: WorkerId, prompt: String },
-    Persist { id: WorkerId },
+    Delete {
+        id: WorkerId,
+    },
+    Restart {
+        id: WorkerId,
+    },
+    Continue {
+        id: WorkerId,
+        prompt: String,
+        plan_mode: bool,
+    },
+    Persist {
+        id: WorkerId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -121,9 +132,13 @@ impl WorkerHandle {
             .map_err(|err| anyhow!("failed to enqueue worker restart: {err}"))
     }
 
-    pub fn continue_worker(&self, id: WorkerId, prompt: String) -> Result<()> {
+    pub fn continue_worker(&self, id: WorkerId, prompt: String, plan_mode: bool) -> Result<()> {
         self.cmd_tx
-            .send(WorkerCommand::Continue { id, prompt })
+            .send(WorkerCommand::Continue {
+                id,
+                prompt,
+                plan_mode,
+            })
             .map_err(|err| anyhow!("failed to enqueue worker continuation: {err}"))
     }
 }
@@ -247,7 +262,9 @@ impl WorkerManager {
                     self.cmd_tx.clone(),
                 ) {
                     Ok(runtime) => {
-                        runtime.completed_steps.store(record.completed_steps, Ordering::SeqCst);
+                        runtime
+                            .completed_steps
+                            .store(record.completed_steps, Ordering::SeqCst);
 
                         // Restore logs to runtime
                         for log_line in &record.logs {
@@ -316,8 +333,12 @@ impl WorkerManager {
                         });
                     }
                 }
-                WorkerCommand::Continue { id, prompt } => {
-                    if let Err(err) = self.handle_continue(id, prompt) {
+                WorkerCommand::Continue {
+                    id,
+                    prompt,
+                    plan_mode,
+                } => {
+                    if let Err(err) = self.handle_continue(id, prompt, plan_mode) {
                         let _ = self.evt_tx.send(WorkerEvent::Error {
                             id: Some(id),
                             message: err.to_string(),
@@ -338,57 +359,72 @@ impl WorkerManager {
         self.next_id += 1;
         self.persist_manager_state();
 
-        let (worktree_path, branch, rel_worktree) = if let Some((existing_path, existing_branch)) = request.existing_worktree {
-            // Use existing worktree
-            let rel_path = existing_path
-                .strip_prefix(&self.repo_root)
-                .unwrap_or(&existing_path)
-                .to_string_lossy()
-                .to_string();
-            (existing_path, existing_branch, rel_path)
-        } else {
-            // Create new worktree
-            fs::create_dir_all(self.repo_root.join(".worktrees"))
-                .context("failed to create .worktrees directory")?;
+        let (worktree_path, branch, rel_worktree) =
+            if let Some((existing_path, existing_branch)) = request.existing_worktree {
+                // Use existing worktree
+                let rel_path = existing_path
+                    .strip_prefix(&self.repo_root)
+                    .unwrap_or(&existing_path)
+                    .to_string_lossy()
+                    .to_string();
+                (existing_path, existing_branch, rel_path)
+            } else {
+                // Create new worktree
+                fs::create_dir_all(self.repo_root.join(".worktrees"))
+                    .context("failed to create .worktrees directory")?;
 
-            let timestamp = OffsetDateTime::now_utc().unix_timestamp();
-            let worktree_name = format!("worker-{id:03}-{timestamp}", id = worker_id.0);
-            let rel_worktree = format!(".worktrees/{worktree_name}");
-            let worktree_path = self.repo_root.join(&rel_worktree);
+                let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+                let worktree_name = format!("worker-{id:03}-{timestamp}", id = worker_id.0);
+                let rel_worktree = format!(".worktrees/{worktree_name}");
+                let worktree_path = self.repo_root.join(&rel_worktree);
 
-            let branch = format!("gensui/{worktree_name}");
-            let base_ref = determine_base_ref(&self.repo_root).unwrap_or_else(|| "HEAD".into());
+                let branch = format!("gensui/{worktree_name}");
+                let base_ref = determine_base_ref(&self.repo_root).unwrap_or_else(|| "HEAD".into());
 
-            let output = Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    &worktree_path.to_string_lossy(),
-                    "-b",
-                    &branch,
-                    &base_ref,
-                ])
-                .current_dir(&self.repo_root)
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped())
-                .output()
-                .with_context(|| "failed to execute git worktree add")?;
+                let output = Command::new("git")
+                    .args([
+                        "worktree",
+                        "add",
+                        &worktree_path.to_string_lossy(),
+                        "-b",
+                        &branch,
+                        &base_ref,
+                    ])
+                    .current_dir(&self.repo_root)
+                    .stderr(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .output()
+                    .with_context(|| "failed to execute git worktree add")?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                return Err(anyhow!(
-                    "git worktree add failed: status={} stdout='{}' stderr='{}'",
-                    output.status,
-                    stdout.trim(),
-                    stderr.trim()
-                ));
-            }
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    return Err(anyhow!(
+                        "git worktree add failed: status={} stdout='{}' stderr='{}'",
+                        output.status,
+                        stdout.trim(),
+                        stderr.trim()
+                    ));
+                }
 
-            (worktree_path, branch, rel_worktree)
-        };
+                (worktree_path, branch, rel_worktree)
+            };
 
         let workflow = if let Some(prompt) = request.free_prompt.clone() {
+            let plan_mode_value = request.plan_mode.unwrap_or(false);
+            eprintln!(
+                "[DEBUG] CreateWorkerRequest.plan_mode: {:?}, evaluated to: {}",
+                request.plan_mode, plan_mode_value
+            );
+
+            let permission_mode = if plan_mode_value {
+                eprintln!("[DEBUG] Setting permission_mode to 'plan'");
+                Some("plan".to_string())
+            } else {
+                eprintln!("[DEBUG] Setting permission_mode to None (normal mode)");
+                None
+            };
+
             Workflow {
                 name: format!("free-form-{}", worker_id.0),
                 description: Some("On-demand Claude execution".to_string()),
@@ -399,7 +435,7 @@ impl WorkerManager {
                         prompt,
                         model: None,
                         allowed_tools: None,
-                        permission_mode: Some("plan".to_string()),
+                        permission_mode,
                         extra_args: None,
                     }),
                     description: Some("User supplied prompt".to_string()),
@@ -435,7 +471,13 @@ impl WorkerManager {
             session_id: None,
         };
 
-        let runtime = WorkerRuntime::new(snapshot, worktree_path, branch, workflow, self.cmd_tx.clone());
+        let runtime = WorkerRuntime::new(
+            snapshot,
+            worktree_path,
+            branch,
+            workflow,
+            self.cmd_tx.clone(),
+        );
         let mut runtime = match runtime {
             Ok(runtime) => runtime,
             Err(err) => {
@@ -571,7 +613,7 @@ impl WorkerManager {
         Ok(())
     }
 
-    fn handle_continue(&mut self, id: WorkerId, prompt: String) -> Result<()> {
+    fn handle_continue(&mut self, id: WorkerId, prompt: String, plan_mode: bool) -> Result<()> {
         let runtime = self
             .workers
             .get_mut(&id)
@@ -581,7 +623,9 @@ impl WorkerManager {
         runtime.stop_agent();
 
         // Mark all current steps as completed
-        runtime.completed_steps.store(runtime.workflow.steps.len(), Ordering::SeqCst);
+        runtime
+            .completed_steps
+            .store(runtime.workflow.steps.len(), Ordering::SeqCst);
 
         // Create a new workflow step with the continuation prompt
         let continue_step = WorkflowStep {
@@ -591,7 +635,11 @@ impl WorkerManager {
                 prompt,
                 model: None,
                 allowed_tools: None,
-                permission_mode: Some("plan".to_string()),
+                permission_mode: if plan_mode {
+                    Some("plan".to_string())
+                } else {
+                    None
+                },
                 extra_args: None,
             }),
             description: Some("User follow-up instruction".to_string()),
@@ -744,7 +792,18 @@ impl WorkerRuntime {
 
         let handle = thread::Builder::new()
             .name(format!("gensui-agent-{}", self.snapshot().name))
-            .spawn(move || agent_simulation(state, cancel, worktree_path, evt_tx, workflow, completed_steps, logs, cmd_tx))
+            .spawn(move || {
+                agent_simulation(
+                    state,
+                    cancel,
+                    worktree_path,
+                    evt_tx,
+                    workflow,
+                    completed_steps,
+                    logs,
+                    cmd_tx,
+                )
+            })
             .expect("failed to spawn agent simulation");
 
         self.handle = Some(handle);
@@ -880,10 +939,58 @@ fn agent_simulation(
             }
             send_log("[PROMPT_END]".to_string(), worker_id);
 
-            // Pass current session_id to continue the session
+            // Command details section
+            send_log("─── Claude Code コマンド ───".to_string(), worker_id);
+
+            // Permission Mode
+            let permission_mode_str = if let Some(mode) = &claude_cfg.permission_mode {
+                match mode.as_str() {
+                    "plan" => "プランモード (plan)".to_string(),
+                    other => format!("{}", other),
+                }
+            } else {
+                "通常モード".to_string()
+            };
+            send_log(
+                format!("Permission Mode: {}", permission_mode_str),
+                worker_id,
+            );
+
+            // Model
+            let model_str = claude_cfg.model.as_deref().unwrap_or("デフォルト");
+            send_log(format!("Model: {}", model_str), worker_id);
+
+            // Allowed Tools
+            let tools_str = if let Some(tools) = &claude_cfg.allowed_tools {
+                if tools.is_empty() {
+                    "なし".to_string()
+                } else {
+                    tools.join(", ")
+                }
+            } else {
+                "全て".to_string()
+            };
+            send_log(format!("Allowed Tools: {}", tools_str), worker_id);
+
+            // Session
             let current_session_id = snapshot_info.session_id.as_deref();
-            run_claude_command(claude_cfg, &prompt, &worktree_path, current_session_id)
-                .map(|(lines, new_session_id)| {
+            let session_str = if current_session_id.is_some() {
+                "継続"
+            } else {
+                "新規"
+            };
+            send_log(format!("Session: {}", session_str), worker_id);
+
+            // Extra Args
+            if let Some(extra) = &claude_cfg.extra_args {
+                if !extra.is_empty() {
+                    send_log(format!("Extra Args: {}", extra.join(" ")), worker_id);
+                }
+            }
+
+            // Pass current session_id to continue the session
+            run_claude_command(claude_cfg, &prompt, &worktree_path, current_session_id).map(
+                |(lines, new_session_id)| {
                     // Store the session_id back into the snapshot
                     if let Some(sid) = new_session_id {
                         if let Ok(mut snapshot) = state.lock() {
@@ -892,7 +999,8 @@ fn agent_simulation(
                         }
                     }
                     lines
-                })
+                },
+            )
         } else if let Some(command) = &step.command {
             send_log(format!("$ {}", command), worker_id);
             run_shell_command(command, &worktree_path)
@@ -982,7 +1090,10 @@ fn run_shell_command(command: &str, dir: &Path) -> Result<Vec<String>> {
     }
 
     if !output.status.success() {
-        return Err(anyhow!("command '{command}' exited with status {}", output.status));
+        return Err(anyhow!(
+            "command '{command}' exited with status {}",
+            output.status
+        ));
     }
 
     Ok(lines)
@@ -1107,11 +1218,13 @@ fn run_claude_command(
     }
 
     if !output.status.success() {
-        let stderr_lines: Vec<_> = lines.iter()
+        let stderr_lines: Vec<_> = lines
+            .iter()
             .filter(|l| l.starts_with("stderr:"))
             .cloned()
             .collect();
-        let other_lines: Vec<_> = lines.iter()
+        let other_lines: Vec<_> = lines
+            .iter()
             .filter(|l| !l.starts_with("stderr:"))
             .cloned()
             .collect();
