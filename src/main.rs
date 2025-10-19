@@ -45,7 +45,7 @@ fn main() -> Result<()> {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new()?;
     let mut last_tick = Instant::now();
-    let tick_rate = Duration::from_millis(200);
+    let tick_rate = Duration::from_millis(50);
 
     loop {
         terminal.draw(|frame| app.render(frame))?;
@@ -89,6 +89,7 @@ struct App {
     input_mode: Option<InputMode>,
     log_view_mode: LogViewMode,
     selected_step: usize,
+    animation_frame: usize,
 }
 
 impl App {
@@ -145,6 +146,7 @@ impl App {
             input_mode: None,
             log_view_mode: LogViewMode::Overview,
             selected_step: 0,
+            animation_frame: 0,
         })
     }
 
@@ -362,7 +364,11 @@ impl App {
             if let Some(view) = self.selected_worker_view() {
                 if !view.structured_logs.is_empty() {
                     self.selected_step = self.selected_step.min(view.structured_logs.len() - 1);
+                } else {
+                    self.selected_step = 0;
                 }
+            } else {
+                self.selected_step = 0;
             }
         }
     }
@@ -620,6 +626,7 @@ impl App {
     fn on_tick(&mut self) {
         self.poll_events();
         self.clamp_selection();
+        self.animation_frame = self.animation_frame.wrapping_add(1);
     }
 
     fn poll_events(&mut self) {
@@ -743,35 +750,134 @@ impl App {
         let visible = self.visible_indices();
         let rows = visible.iter().enumerate().map(|(table_idx, worker_idx)| {
             let worker = &self.workers[*worker_idx];
-            let mut style = Style::default().fg(status_color(worker.snapshot.status));
+
+            // For Running status, don't apply row-level color so cell colors show through
+            let mut style = if worker.snapshot.status == WorkerStatus::Running {
+                Style::default()
+            } else {
+                Style::default().fg(status_color(worker.snapshot.status))
+            };
+
             if table_idx == self.selected {
-                style = style.bg(Color::DarkGray).fg(Color::White);
+                // For Running workers, only set background (not foreground) to preserve rainbow colors
+                if worker.snapshot.status == WorkerStatus::Running {
+                    style = style.bg(Color::DarkGray);
+                } else {
+                    style = style.bg(Color::DarkGray).fg(Color::White);
+                }
             }
 
-            Row::new(vec![
-                Cell::from(worker.snapshot.name.clone()),
+            // Add spinner and rainbow gradient animation for Running status
+            const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            const RAINBOW_COLORS: &[Color] = &[
+                Color::Red,
+                Color::LightRed,
+                Color::Yellow,
+                Color::LightYellow,
+                Color::Green,
+                Color::LightGreen,
+                Color::Cyan,
+                Color::LightCyan,
+                Color::Blue,
+                Color::LightBlue,
+                Color::Magenta,
+                Color::LightMagenta,
+            ];
+
+            // Animate per-character colors for Running status (left-to-right flow)
+            let (name_cell, status_cell, last_event_cell) = if worker.snapshot.status == WorkerStatus::Running {
+                let spinner_idx = self.animation_frame % SPINNER_CHARS.len();
+                let spinner = SPINNER_CHARS[spinner_idx];
+
+                // Faster animation for smooth flow
+                let slow_frame = self.animation_frame / 3;
+
+                let is_selected = table_idx == self.selected;
+
+                // Helper function to create rainbow text with per-character colors
+                let create_rainbow_line = |text: &str| -> Vec<Span> {
+                    if text.is_empty() {
+                        return vec![Span::raw("")];
+                    }
+
+                    let mut spans = Vec::new();
+                    let chars_vec: Vec<char> = text.chars().collect();
+                    for (char_idx, ch) in chars_vec.iter().enumerate() {
+                        let color_idx = (slow_frame + char_idx / 2) % RAINBOW_COLORS.len();
+                        let color = RAINBOW_COLORS[color_idx];
+                        let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                        if is_selected {
+                            style = style.bg(Color::DarkGray);
+                        }
+                        spans.push(Span::styled(ch.to_string(), style));
+                    }
+                    spans
+                };
+
+                let status_text = format!("{} {}", spinner, worker.snapshot.status.label());
+                let sparkles = &["✨", "💫", "⭐", "🌟"];
+                let sparkle_idx = (self.animation_frame / 10) % sparkles.len();
+                let sparkle = sparkles[sparkle_idx];
+
+                // For last_event, add sparkle as separate span to avoid emoji breakage
+                let sparkle_style = if is_selected {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                let mut last_event_spans = vec![Span::styled(format!("{} ", sparkle), sparkle_style)];
+                last_event_spans.extend(create_rainbow_line(&worker.snapshot.last_event));
+
+                (
+                    Cell::from(Line::from(create_rainbow_line(&worker.snapshot.name))),
+                    Cell::from(Line::from(create_rainbow_line(&status_text))),
+                    Cell::from(Line::from(last_event_spans)),
+                )
+            } else {
+                (
+                    Cell::from(worker.snapshot.name.clone()),
+                    Cell::from(worker.snapshot.status.label()),
+                    Cell::from(worker.snapshot.last_event.clone()),
+                )
+            };
+
+            // For Running workers that are selected, apply background to all cells
+            let other_cell_style = if worker.snapshot.status == WorkerStatus::Running && table_idx == self.selected {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+
+            let row = Row::new(vec![
+                name_cell,
                 Cell::from(
                     worker
                         .snapshot
                         .issue
                         .clone()
                         .unwrap_or_else(|| "Unassigned".into()),
-                ),
-                Cell::from(worker.snapshot.workflow.clone()),
+                ).style(other_cell_style),
+                Cell::from(worker.snapshot.workflow.clone()).style(other_cell_style),
                 Cell::from(worker.snapshot.current_step.clone().unwrap_or_else(|| {
                     if worker.snapshot.total_steps > 0 {
                         format!("0/{} steps", worker.snapshot.total_steps)
                     } else {
                         "-".into()
                     }
-                })),
-                Cell::from(worker.snapshot.agent.clone()),
-                Cell::from(worker.snapshot.worktree.clone()),
-                Cell::from(worker.snapshot.branch.clone()),
-                Cell::from(worker.snapshot.status.label()),
-                Cell::from(worker.snapshot.last_event.clone()),
-            ])
-            .style(style)
+                })).style(other_cell_style),
+                Cell::from(worker.snapshot.agent.clone()).style(other_cell_style),
+                Cell::from(worker.snapshot.worktree.clone()).style(other_cell_style),
+                Cell::from(worker.snapshot.branch.clone()).style(other_cell_style),
+                status_cell,
+                last_event_cell,
+            ]);
+
+            // Only apply row style for non-Running status (to preserve rainbow colors)
+            if worker.snapshot.status == WorkerStatus::Running {
+                row
+            } else {
+                row.style(style)
+            }
         });
 
         let header = Row::new(vec![
@@ -1006,11 +1112,20 @@ impl App {
                 return;
             }
 
-            // Build table rows
-            let header = Row::new(vec!["#", "Step", "Status", "Summary"])
-                .style(Style::default().add_modifier(Modifier::BOLD))
-                .bottom_margin(1);
+            // Clamp selected_step to valid range to prevent panic
+            let safe_selected_step = self.selected_step.min(entries.len().saturating_sub(1));
 
+            // Build table rows
+            let header = Row::new(vec![
+                Cell::from("#"),
+                Cell::from("Step"),
+                Cell::from("Status"),
+                Cell::from("Summary"),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD))
+            .bottom_margin(1);
+
+            // Add status and summary processing with safe string slicing
             let rows: Vec<Row> = entries
                 .iter()
                 .enumerate()
@@ -1021,29 +1136,32 @@ impl App {
                         StepStatus::Failed => "✗ Failed",
                     };
 
+                    // Safe string truncation using chars instead of byte slicing
                     let summary = entry
                         .result_lines
                         .first()
                         .map(|s| {
-                            if s.len() > 60 {
-                                format!("{}...", &s[..60])
+                            let chars: Vec<char> = s.chars().collect();
+                            if chars.len() > 60 {
+                                let truncated: String = chars.iter().take(60).collect();
+                                format!("{}...", truncated)
                             } else {
                                 s.clone()
                             }
                         })
                         .unwrap_or_else(|| "(no result)".to_string());
 
-                    let style = if idx == self.selected_step {
+                    let style = if idx == safe_selected_step {
                         Style::default().bg(Color::DarkGray)
                     } else {
                         Style::default()
                     };
 
                     Row::new(vec![
-                        format!("{}", entry.step_index),
-                        entry.step_name.clone(),
-                        status_str.to_string(),
-                        summary,
+                        Cell::from(format!("{}", entry.step_index)),
+                        Cell::from(entry.step_name.clone()),
+                        Cell::from(status_str),
+                        Cell::from(summary),
                     ])
                     .style(style)
                 })
@@ -1053,7 +1171,7 @@ impl App {
                 Constraint::Length(4),
                 Constraint::Length(20),
                 Constraint::Length(12),
-                Constraint::Percentage(60),
+                Constraint::Min(30),
             ];
 
             let table = Table::new(rows, widths)
