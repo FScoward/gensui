@@ -1501,7 +1501,7 @@ where
                     }
                     _ => {
                         // Log raw JSON for other event types for debugging
-                        log_fn(format!("🔍 JSON: {}", line));
+                        // log_fn(format!("🔍 JSON: {}", line));
                     }
                 }
             } else {
