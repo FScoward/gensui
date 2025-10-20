@@ -61,7 +61,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 
     loop {
         // Check for interactive mode request
-        if let Some(request) = app.pending_interactive_mode.take() {
+        if let Some(request) = app.ui_state.pending_interactive_mode.take() {
             // Suspend TUI
             disable_raw_mode()?;
             crossterm::execute!(
@@ -139,6 +139,115 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     Ok(())
 }
 
+struct UIState {
+    show_help: bool,
+    show_logs: bool,
+    log_view_mode: LogViewMode,
+    selected_step: usize,
+    selected: usize,
+    animation_frame: usize,
+    input_mode: Option<InputMode>,
+    pending_interactive_mode: Option<InteractiveRequest>,
+    status_filter: Option<WorkerStatus>,
+}
+
+impl UIState {
+    fn new() -> Self {
+        Self {
+            show_help: false,
+            show_logs: false,
+            log_view_mode: LogViewMode::Overview,
+            selected_step: 0,
+            selected: 0,
+            animation_frame: 0,
+            input_mode: None,
+            pending_interactive_mode: None,
+            status_filter: None,
+        }
+    }
+}
+
+struct LogManager {
+    log_messages: VecDeque<String>,
+    log_scroll: usize,
+    auto_scroll_logs: bool,
+}
+
+impl LogManager {
+    fn new(capacity: usize) -> Self {
+        Self {
+            log_messages: VecDeque::with_capacity(capacity),
+            log_scroll: 0,
+            auto_scroll_logs: true,
+        }
+    }
+
+    fn push(&mut self, message: String, capacity: usize) {
+        if self.log_messages.len() >= capacity {
+            self.log_messages.pop_front();
+        }
+        self.log_messages.push_back(message);
+    }
+
+    fn compact(&mut self, min_size: usize) {
+        while self.log_messages.len() > min_size {
+            self.log_messages.pop_front();
+        }
+    }
+}
+
+struct WorkerManager {
+    workers: Vec<WorkerView>,
+    permission_prompt: Option<PermissionPromptState>,
+    permission_tracker: HashMap<u64, PermissionTrackerEntry>,
+}
+
+impl WorkerManager {
+    fn new() -> Self {
+        Self {
+            workers: Vec::new(),
+            permission_prompt: None,
+            permission_tracker: HashMap::new(),
+        }
+    }
+
+    fn add_or_update(&mut self, snapshot: WorkerSnapshot) {
+        if let Some(pos) = self
+            .workers
+            .iter()
+            .position(|view| view.snapshot.id == snapshot.id)
+        {
+            let view = &mut self.workers[pos];
+            view.update_snapshot(snapshot);
+        } else {
+            let view = WorkerView::new(snapshot);
+            self.workers.push(view);
+        }
+    }
+
+    fn remove(&mut self, id: WorkerId) -> Option<WorkerView> {
+        if let Some(pos) = self.workers.iter().position(|view| view.snapshot.id == id) {
+            Some(self.workers.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    fn add_log(&mut self, id: WorkerId, line: String) {
+        if let Some(pos) = self.workers.iter().position(|view| view.snapshot.id == id) {
+            let view = &mut self.workers[pos];
+            view.push_log(line);
+        }
+    }
+
+    fn worker_name_by_id(&self, id: WorkerId) -> Option<String> {
+        self.workers
+            .iter()
+            .find(|view| view.snapshot.id == id)
+            .map(|view| view.snapshot.name.clone())
+    }
+}
+
 struct App {
     repo_root: std::path::PathBuf,
     manager: WorkerHandle,
@@ -146,21 +255,9 @@ struct App {
     state_store: StateStore,
     workflows: Vec<Workflow>,
     selected_workflow_idx: usize,
-    workers: Vec<WorkerView>,
-    selected: usize,
-    show_help: bool,
-    show_logs: bool,
-    log_messages: VecDeque<String>,
-    log_scroll: usize,
-    status_filter: Option<WorkerStatus>,
-    input_mode: Option<InputMode>,
-    log_view_mode: LogViewMode,
-    selected_step: usize,
-    animation_frame: usize,
-    permission_prompt: Option<PermissionPromptState>,
-    permission_tracker: HashMap<u64, PermissionTrackerEntry>,
-    pending_interactive_mode: Option<InteractiveRequest>,
-    auto_scroll_logs: bool,
+    ui_state: UIState,
+    log_manager: LogManager,
+    worker_manager: WorkerManager,
 }
 
 struct InteractiveRequest {
@@ -198,10 +295,10 @@ impl App {
 
         // Don't restore workers to UI - they are not running in WorkerManager
         // Only restore action logs for history
-        let mut log_messages = VecDeque::with_capacity(GLOBAL_LOG_CAPACITY);
+        let mut log_manager = LogManager::new(GLOBAL_LOG_CAPACITY);
         let history = state_store.load_action_log(GLOBAL_LOG_CAPACITY)?;
         for entry in history {
-            log_messages.push_back(format_action_log(&entry));
+            log_manager.push(format_action_log(&entry), GLOBAL_LOG_CAPACITY);
         }
 
         let (manager, event_rx) = spawn_worker_system(repo_root.clone(), config)?;
@@ -213,359 +310,389 @@ impl App {
             state_store,
             workflows,
             selected_workflow_idx,
-            workers: Vec::new(),
-            selected: 0,
-            show_help: false,
-            show_logs: false,
-            log_messages,
-            log_scroll: 0,
-            status_filter: None,
-            input_mode: None,
-            log_view_mode: LogViewMode::Overview,
-            selected_step: 0,
-            animation_frame: 0,
-            permission_prompt: None,
-            permission_tracker: HashMap::new(),
-            pending_interactive_mode: None,
-            auto_scroll_logs: true,
+            ui_state: UIState::new(),
+            log_manager,
+            worker_manager: WorkerManager::new(),
         })
     }
 
     fn handle_key(&mut self, key_event: KeyEvent) -> bool {
-        if self.permission_prompt.is_some() {
-            let key_code = key_event.code;
+        if self.worker_manager.permission_prompt.is_some() {
+            return self.handle_permission_prompt_key(key_event);
+        }
 
-            let mut should_submit = None;
+        if self.ui_state.input_mode.is_some() {
+            return self.handle_input_mode_key(key_event);
+        }
 
-            if let Some(prompt) = self.permission_prompt.as_mut() {
-                match key_code {
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key_event.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            prompt.toggle();
-                        }
+        self.handle_normal_key(key_event)
+    }
+
+    fn handle_permission_prompt_key(&mut self, key_event: KeyEvent) -> bool {
+        let key_code = key_event.code;
+        let mut should_submit = None;
+
+        if let Some(prompt) = self.worker_manager.permission_prompt.as_mut() {
+            match key_code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                    if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key_event.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        prompt.toggle();
                     }
-                    KeyCode::Char('y') if key_event.modifiers.is_empty() => {
-                        should_submit = Some(PermissionDecision::Allow {
-                            permission_mode: None,
-                            allowed_tools: None,
+                }
+                KeyCode::Char('y') if key_event.modifiers.is_empty() => {
+                    should_submit = Some(PermissionDecision::Allow {
+                        permission_mode: None,
+                        allowed_tools: None,
+                    });
+                }
+                KeyCode::Char('n') if key_event.modifiers.is_empty() => {
+                    should_submit = Some(PermissionDecision::Deny);
+                }
+                KeyCode::Enter => {
+                    should_submit = Some(prompt.selection.clone());
+                }
+                KeyCode::Esc => {
+                    should_submit = Some(PermissionDecision::Deny);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(decision) = should_submit {
+            match decision {
+                PermissionDecision::Allow { .. } => {
+                    let mut tools = HashMap::new();
+                    for tool_def in AVAILABLE_TOOLS {
+                        tools.insert(tool_def.name.to_string(), false);
+                    }
+
+                    if let Some(prompt_state) = &self.worker_manager.permission_prompt {
+                        let worker_id = prompt_state.worker_id;
+                        let request_id = prompt_state.request.request_id;
+                        self.worker_manager.permission_prompt = None;
+
+                        self.ui_state.input_mode = Some(InputMode::ToolSelection {
+                            tools,
+                            selected_idx: 0,
+                            permission_mode: "acceptEdits".to_string(),
+                            worker_id,
+                            request_id,
                         });
                     }
-                    KeyCode::Char('n') if key_event.modifiers.is_empty() => {
-                        should_submit = Some(PermissionDecision::Deny);
-                    }
-                    KeyCode::Enter => {
-                        should_submit = Some(prompt.selection.clone());
-                    }
-                    KeyCode::Esc => {
-                        should_submit = Some(PermissionDecision::Deny);
-                    }
-                    _ => {}
+                }
+                PermissionDecision::Deny => {
+                    self.submit_permission_decision(decision);
                 }
             }
-
-            if let Some(decision) = should_submit {
-                // If Allow, open tool selection modal
-                match decision {
-                    PermissionDecision::Allow { .. } => {
-                        // Initialize tool selection with all tools unchecked
-                        let mut tools = HashMap::new();
-                        for tool_def in AVAILABLE_TOOLS {
-                            tools.insert(tool_def.name.to_string(), false);
-                        }
-
-                        // Save worker_id and request_id before clearing permission_prompt
-                        if let Some(prompt_state) = &self.permission_prompt {
-                            let worker_id = prompt_state.worker_id;
-                            let request_id = prompt_state.request.request_id;
-
-                            // Clear permission_prompt to allow tool selection modal to receive key input
-                            self.permission_prompt = None;
-
-                            self.input_mode = Some(InputMode::ToolSelection {
-                                tools,
-                                selected_idx: 0,
-                                permission_mode: "acceptEdits".to_string(),
-                                worker_id,
-                                request_id,
-                            });
-                        }
-                    }
-                    PermissionDecision::Deny => {
-                        self.submit_permission_decision(decision);
-                    }
-                }
-            }
-
-            return false;
         }
 
-        if let Some(mode) = self.input_mode.as_mut() {
-            match mode {
-                InputMode::FreePrompt {
-                    buffer,
-                    force_new,
-                    permission_mode,
-                    worker_name,
-                } => match key_event.code {
-                    KeyCode::Esc => {
-                        self.input_mode = None;
-                    }
-                    KeyCode::Enter => {
-                        let prompt = buffer.trim().to_string();
-                        let is_force_new = *force_new;
-                        let mode = permission_mode.clone();
-                        let name = worker_name.clone();
-                        self.input_mode = None;
-                        if !prompt.is_empty() {
-                            self.submit_free_prompt(prompt, is_force_new, mode, name);
-                        } else {
-                            self.push_log("空の指示は送信されませんでした".into());
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    KeyCode::Tab => {
-                        buffer.push('\t');
-                    }
-                    KeyCode::Char('p') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Cycle through: None -> "plan" -> "acceptEdits" -> None
-                        *permission_mode = match permission_mode.as_deref() {
-                            None => Some("plan".to_string()),
-                            Some("plan") => Some("acceptEdits".to_string()),
-                            Some("acceptEdits") => None,
-                            _ => None,
-                        };
-                    }
-                    KeyCode::Char(c) => {
-                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key_event.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            buffer.push(c);
-                        }
-                    }
-                    _ => {}
-                },
-                InputMode::CreateWorkerSelection { selected } => match key_event.code {
-                    KeyCode::Esc => {
-                        self.input_mode = None;
-                    }
-                    KeyCode::Enter => {
-                        let choice = *selected;
-                        self.input_mode = None;
-                        if choice == 0 {
-                            // Run workflow - show name input first
-                            self.enqueue_create_worker();
-                        } else if choice == 1 {
-                            // Free input - show name input first, then free prompt
-                            self.show_name_input_for_free_prompt();
-                        } else {
-                            // Use existing worktree
-                            self.show_worktree_selection();
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selected = selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *selected = (*selected + 1).min(2);
-                    }
-                    _ => {}
-                },
-                InputMode::WorktreeSelection {
-                    worktrees,
-                    selected,
-                } => match key_event.code {
-                    KeyCode::Esc => {
-                        self.input_mode = None;
-                    }
-                    KeyCode::Enter => {
-                        if let Some(worktree) = worktrees.get(*selected) {
-                            let worktree_path = worktree.path.clone();
-                            let branch = worktree.branch.clone();
-                            self.input_mode = None;
-                            self.enqueue_create_worker_with_worktree(worktree_path, branch);
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selected = selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let max_idx = worktrees.len().saturating_sub(1);
-                        *selected = (*selected + 1).min(max_idx);
-                    }
-                    _ => {}
-                },
-                InputMode::ToolSelection {
-                    tools,
-                    selected_idx,
-                    permission_mode,
-                    worker_id,
-                    request_id,
-                } => {
-                    // Will implement key handling here
-                    match key_event.code {
-                        KeyCode::Esc => {
-                            // Cancel - send Deny
-                            if let Err(err) = self.manager.respond_permission(
-                                *worker_id,
-                                *request_id,
-                                PermissionDecision::Deny,
-                            ) {
-                                self.push_log(format!("権限応答の送信に失敗しました: {err}"));
-                            }
-                            self.input_mode = None;
-                        }
-                        KeyCode::Enter => {
-                            // Submit with selected tools and permission_mode
-                            let selected_tools: Vec<String> = tools
-                                .iter()
-                                .filter_map(|(name, &checked)| if checked { Some(name.clone()) } else { None })
-                                .collect();
+        false
+    }
 
-                            let final_decision = PermissionDecision::Allow {
-                                permission_mode: Some(permission_mode.clone()),
-                                allowed_tools: if selected_tools.is_empty() { None } else { Some(selected_tools) },
-                            };
+    fn handle_input_mode_key(&mut self, key_event: KeyEvent) -> bool {
+        let Some(mode) = self.ui_state.input_mode.as_mut() else {
+            return false;
+        };
 
-                            let wid = *worker_id;
-                            let rid = *request_id;
+        match mode {
+            InputMode::FreePrompt { .. } => self.handle_free_prompt_key(key_event),
+            InputMode::CreateWorkerSelection { .. } => self.handle_create_selection_key(key_event),
+            InputMode::WorktreeSelection { .. } => self.handle_worktree_selection_key(key_event),
+            InputMode::ToolSelection { .. } => self.handle_tool_selection_key(key_event),
+            InputMode::NameInput { .. } => self.handle_name_input_key(key_event),
+            InputMode::RenameWorker { .. } => self.handle_rename_worker_key(key_event),
+        }
+    }
 
-                            // Clear input mode first to release borrow
-                            self.input_mode = None;
+    fn handle_free_prompt_key(&mut self, key_event: KeyEvent) -> bool {
+        let InputMode::FreePrompt {
+            buffer,
+            force_new,
+            permission_mode,
+            worker_name,
+        } = self.ui_state.input_mode.as_mut().unwrap() else {
+            return false;
+        };
 
-                            if let Err(err) = self.manager.respond_permission(wid, rid, final_decision.clone()) {
-                                self.push_log(format!("権限応答の送信に失敗しました: {err}"));
-                            } else {
-                                let worker_name = self.worker_name_by_id(wid).unwrap_or_else(|| format!("worker-{}", wid.0));
-                                self.permission_tracker.insert(
-                                    rid,
-                                    PermissionTrackerEntry {
-                                        worker_name,
-                                        step_name: format!("Tool selection"),
-                                    },
-                                );
-                            }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            *selected_idx = selected_idx.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            let max_idx = tools.len(); // tools.len() is for permission_mode toggle
-                            *selected_idx = (*selected_idx + 1).min(max_idx);
-                        }
-                        KeyCode::Char(' ') => {
-                            // Toggle tool selection
-                            if *selected_idx < tools.len() {
-                                let tool_name = AVAILABLE_TOOLS[*selected_idx].name;
-                                if let Some(checked) = tools.get_mut(tool_name) {
-                                    *checked = !*checked;
-                                }
-                            } else {
-                                // Toggle permission_mode
-                                *permission_mode = match permission_mode.as_str() {
-                                    "acceptEdits" => "bypassPermissions".to_string(),
-                                    _ => "acceptEdits".to_string(),
-                                };
-                            }
-                        }
-                        _ => {}
+        match key_event.code {
+            KeyCode::Esc => {
+                self.ui_state.input_mode = None;
+            }
+            KeyCode::Enter => {
+                let prompt = buffer.trim().to_string();
+                let is_force_new = *force_new;
+                let mode = permission_mode.clone();
+                let name = worker_name.clone();
+                self.ui_state.input_mode = None;
+                if !prompt.is_empty() {
+                    self.submit_free_prompt(prompt, is_force_new, mode, name);
+                } else {
+                    self.push_log("空の指示は送信されませんでした".into());
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Tab => {
+                buffer.push('\t');
+            }
+            KeyCode::Char('p') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                *permission_mode = match permission_mode.as_deref() {
+                    None => Some("plan".to_string()),
+                    Some("plan") => Some("acceptEdits".to_string()),
+                    Some("acceptEdits") => None,
+                    _ => None,
+                };
+            }
+            KeyCode::Char(c) => {
+                if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key_event.modifiers.contains(KeyModifiers::ALT)
+                {
+                    buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_create_selection_key(&mut self, key_event: KeyEvent) -> bool {
+        let InputMode::CreateWorkerSelection { selected } = self.ui_state.input_mode.as_mut().unwrap() else {
+            return false;
+        };
+
+        match key_event.code {
+            KeyCode::Esc => {
+                self.ui_state.input_mode = None;
+            }
+            KeyCode::Enter => {
+                let choice = *selected;
+                self.ui_state.input_mode = None;
+                if choice == 0 {
+                    self.enqueue_create_worker();
+                } else if choice == 1 {
+                    self.show_name_input_for_free_prompt();
+                } else {
+                    self.show_worktree_selection();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(2);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_worktree_selection_key(&mut self, key_event: KeyEvent) -> bool {
+        let InputMode::WorktreeSelection { worktrees, selected } = self.ui_state.input_mode.as_mut().unwrap() else {
+            return false;
+        };
+
+        match key_event.code {
+            KeyCode::Esc => {
+                self.ui_state.input_mode = None;
+            }
+            KeyCode::Enter => {
+                if let Some(worktree) = worktrees.get(*selected) {
+                    let worktree_path = worktree.path.clone();
+                    let branch = worktree.branch.clone();
+                    self.ui_state.input_mode = None;
+                    self.enqueue_create_worker_with_worktree(worktree_path, branch);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max_idx = worktrees.len().saturating_sub(1);
+                *selected = (*selected + 1).min(max_idx);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_tool_selection_key(&mut self, key_event: KeyEvent) -> bool {
+        let InputMode::ToolSelection {
+            tools,
+            selected_idx,
+            permission_mode,
+            worker_id,
+            request_id,
+        } = self.ui_state.input_mode.as_mut().unwrap() else {
+            return false;
+        };
+
+        match key_event.code {
+            KeyCode::Esc => {
+                if let Err(err) = self.manager.respond_permission(
+                    *worker_id,
+                    *request_id,
+                    PermissionDecision::Deny,
+                ) {
+                    self.push_log(format!("権限応答の送信に失敗しました: {err}"));
+                }
+                self.ui_state.input_mode = None;
+            }
+            KeyCode::Enter => {
+                let selected_tools: Vec<String> = tools
+                    .iter()
+                    .filter_map(|(name, &checked)| if checked { Some(name.clone()) } else { None })
+                    .collect();
+
+                let final_decision = PermissionDecision::Allow {
+                    permission_mode: Some(permission_mode.clone()),
+                    allowed_tools: if selected_tools.is_empty() { None } else { Some(selected_tools) },
+                };
+
+                let wid = *worker_id;
+                let rid = *request_id;
+                self.ui_state.input_mode = None;
+
+                if let Err(err) = self.manager.respond_permission(wid, rid, final_decision.clone()) {
+                    self.push_log(format!("権限応答の送信に失敗しました: {err}"));
+                } else {
+                    let worker_name = self.worker_manager.worker_name_by_id(wid).unwrap_or_else(|| format!("worker-{}", wid.0));
+                    self.worker_manager.permission_tracker.insert(
+                        rid,
+                        PermissionTrackerEntry {
+                            worker_name,
+                            step_name: format!("Tool selection"),
+                        },
+                    );
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected_idx = selected_idx.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max_idx = tools.len();
+                *selected_idx = (*selected_idx + 1).min(max_idx);
+            }
+            KeyCode::Char(' ') => {
+                if *selected_idx < tools.len() {
+                    let tool_name = AVAILABLE_TOOLS[*selected_idx].name;
+                    if let Some(checked) = tools.get_mut(tool_name) {
+                        *checked = !*checked;
+                    }
+                } else {
+                    *permission_mode = match permission_mode.as_str() {
+                        "acceptEdits" => "bypassPermissions".to_string(),
+                        _ => "acceptEdits".to_string(),
+                    };
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_name_input_key(&mut self, key_event: KeyEvent) -> bool {
+        let InputMode::NameInput { buffer, workflow_name, next_action } = self.ui_state.input_mode.as_mut().unwrap() else {
+            return false;
+        };
+
+        match key_event.code {
+            KeyCode::Esc => {
+                let workflow = workflow_name.clone();
+                let action = next_action.clone();
+                self.ui_state.input_mode = None;
+
+                match action {
+                    NameInputNextAction::CreateWithWorkflow => {
+                        self.create_worker_with_default_name(workflow);
+                    }
+                    NameInputNextAction::CreateWithFreePrompt => {
+                        self.ui_state.input_mode = Some(InputMode::FreePrompt {
+                            buffer: String::new(),
+                            force_new: true,
+                            permission_mode: None,
+                            worker_name: None,
+                        });
                     }
                 }
-                InputMode::NameInput { buffer, workflow_name, next_action } => match key_event.code {
-                    KeyCode::Esc => {
-                        // Cancel and use default name
-                        let workflow = workflow_name.clone();
-                        let action = next_action.clone();
-                        self.input_mode = None;
-
-                        match action {
-                            NameInputNextAction::CreateWithWorkflow => {
-                                self.create_worker_with_default_name(workflow);
-                            }
-                            NameInputNextAction::CreateWithFreePrompt => {
-                                // Show free prompt modal with default name
-                                self.input_mode = Some(InputMode::FreePrompt {
-                                    buffer: String::new(),
-                                    force_new: true,
-                                    permission_mode: None,
-                                    worker_name: None,
-                                });
-                            }
-                        }
-                    }
-                    KeyCode::Enter => {
-                        let name = buffer.trim().to_string();
-                        let workflow = workflow_name.clone();
-                        let action = next_action.clone();
-                        self.input_mode = None;
-
-                        match action {
-                            NameInputNextAction::CreateWithWorkflow => {
-                                if name.is_empty() {
-                                    // Use default name
-                                    self.create_worker_with_default_name(workflow);
-                                } else {
-                                    // Use user-provided name
-                                    self.create_worker_with_name(name, workflow);
-                                }
-                            }
-                            NameInputNextAction::CreateWithFreePrompt => {
-                                // Show free prompt modal
-                                let worker_name = if name.is_empty() { None } else { Some(name) };
-                                self.input_mode = Some(InputMode::FreePrompt {
-                                    buffer: String::new(),
-                                    force_new: true,
-                                    permission_mode: None,
-                                    worker_name,
-                                });
-                            }
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key_event.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            buffer.push(c);
-                        }
-                    }
-                    _ => {}
-                },
-                InputMode::RenameWorker { buffer, worker_id } => match key_event.code {
-                    KeyCode::Esc => {
-                        self.input_mode = None;
-                    }
-                    KeyCode::Enter => {
-                        let new_name = buffer.trim().to_string();
-                        let wid = *worker_id;
-                        self.input_mode = None;
-                        if !new_name.is_empty() {
-                            self.rename_worker(wid, new_name);
-                        } else {
-                            self.push_log("空の名前は無効です".into());
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key_event.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            buffer.push(c);
-                        }
-                    }
-                    _ => {}
-                },
             }
-            return false;
-        }
+            KeyCode::Enter => {
+                let name = buffer.trim().to_string();
+                let workflow = workflow_name.clone();
+                let action = next_action.clone();
+                self.ui_state.input_mode = None;
 
+                match action {
+                    NameInputNextAction::CreateWithWorkflow => {
+                        if name.is_empty() {
+                            self.create_worker_with_default_name(workflow);
+                        } else {
+                            self.create_worker_with_name(name, workflow);
+                        }
+                    }
+                    NameInputNextAction::CreateWithFreePrompt => {
+                        let worker_name = if name.is_empty() { None } else { Some(name) };
+                        self.ui_state.input_mode = Some(InputMode::FreePrompt {
+                            buffer: String::new(),
+                            force_new: true,
+                            permission_mode: None,
+                            worker_name,
+                        });
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key_event.modifiers.contains(KeyModifiers::ALT)
+                {
+                    buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_rename_worker_key(&mut self, key_event: KeyEvent) -> bool {
+        let InputMode::RenameWorker { buffer, worker_id } = self.ui_state.input_mode.as_mut().unwrap() else {
+            return false;
+        };
+
+        match key_event.code {
+            KeyCode::Esc => {
+                self.ui_state.input_mode = None;
+            }
+            KeyCode::Enter => {
+                let new_name = buffer.trim().to_string();
+                let wid = *worker_id;
+                self.ui_state.input_mode = None;
+                if !new_name.is_empty() {
+                    self.rename_worker(wid, new_name);
+                } else {
+                    self.push_log("空の名前は無効です".into());
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key_event.modifiers.contains(KeyModifiers::ALT)
+                {
+                    buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_normal_key(&mut self, key_event: KeyEvent) -> bool {
         match key_event.code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('c') => self.show_create_selection(),
@@ -578,31 +705,31 @@ impl App {
             KeyCode::Char('w') => self.cycle_workflow(),
             KeyCode::Char('a') => self.cycle_filter(),
             KeyCode::Tab => {
-                if self.show_logs {
+                if self.ui_state.show_logs {
                     self.switch_log_tab_next();
                 }
             }
             KeyCode::BackTab => {
-                if self.show_logs {
+                if self.ui_state.show_logs {
                     self.switch_log_tab_prev();
                 }
             }
             KeyCode::Enter => {
-                if self.show_logs && self.log_view_mode == LogViewMode::Overview {
+                if self.ui_state.show_logs && self.ui_state.log_view_mode == LogViewMode::Overview {
                     self.enter_detail_from_overview();
                 }
             }
             KeyCode::Esc => {
-                if self.show_logs
-                    && (self.log_view_mode == LogViewMode::Detail
-                        || self.log_view_mode == LogViewMode::Raw)
+                if self.ui_state.show_logs
+                    && (self.ui_state.log_view_mode == LogViewMode::Detail
+                        || self.ui_state.log_view_mode == LogViewMode::Raw)
                 {
                     self.back_to_overview();
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.show_logs {
-                    match self.log_view_mode {
+                if self.ui_state.show_logs {
+                    match self.ui_state.log_view_mode {
                         LogViewMode::Overview => self.select_step_up(),
                         LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_up(),
                     }
@@ -611,8 +738,8 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.show_logs {
-                    match self.log_view_mode {
+                if self.ui_state.show_logs {
+                    match self.ui_state.log_view_mode {
                         LogViewMode::Overview => self.select_step_down(),
                         LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_down(),
                     }
@@ -621,26 +748,26 @@ impl App {
                 }
             }
             KeyCode::Home => {
-                if self.show_logs {
+                if self.ui_state.show_logs {
                     self.scroll_log_home();
                 } else {
                     self.select_first();
                 }
             }
             KeyCode::End => {
-                if self.show_logs {
+                if self.ui_state.show_logs {
                     self.scroll_log_end();
                 } else {
                     self.select_last();
                 }
             }
             KeyCode::PageUp => {
-                if self.show_logs {
+                if self.ui_state.show_logs {
                     self.scroll_log_page_up();
                 }
             }
             KeyCode::PageDown => {
-                if self.show_logs {
+                if self.ui_state.show_logs {
                     self.scroll_log_page_down();
                 }
             }
@@ -666,7 +793,7 @@ impl App {
             .get(self.selected_workflow_idx)
             .map(|wf| wf.name.clone());
 
-        self.input_mode = Some(InputMode::NameInput {
+        self.ui_state.input_mode = Some(InputMode::NameInput {
             buffer: String::new(),
             workflow_name,
             next_action: NameInputNextAction::CreateWithWorkflow,
@@ -674,7 +801,7 @@ impl App {
     }
 
     fn show_name_input_for_free_prompt(&mut self) {
-        self.input_mode = Some(InputMode::NameInput {
+        self.ui_state.input_mode = Some(InputMode::NameInput {
             buffer: String::new(),
             workflow_name: None,
             next_action: NameInputNextAction::CreateWithFreePrompt,
@@ -707,7 +834,7 @@ impl App {
 
     fn show_rename_modal(&mut self) {
         if let Some(id) = self.selected_worker_id() {
-            self.input_mode = Some(InputMode::RenameWorker {
+            self.ui_state.input_mode = Some(InputMode::RenameWorker {
                 buffer: String::new(),
                 worker_id: id,
             });
@@ -727,15 +854,15 @@ impl App {
     fn enqueue_delete_worker(&mut self) {
         if let Some(id) = self.selected_worker_id() {
             // Check if this is an archived worker
-            if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == id) {
+            if let Some(worker) = self.worker_manager.workers.iter().find(|w| w.snapshot.id == id) {
                 if worker.snapshot.status == WorkerStatus::Archived {
                     // For archived workers, just delete the state file
                     if let Err(err) = self.state_store.delete_worker(&worker.snapshot.name) {
                         self.push_log(format!("アーカイブ削除に失敗しました: {err}"));
                     } else {
                         // Remove from UI
-                        if let Some(pos) = self.workers.iter().position(|w| w.snapshot.id == id) {
-                            let worker = self.workers.remove(pos);
+                        if let Some(pos) = self.worker_manager.workers.iter().position(|w| w.snapshot.id == id) {
+                            let worker = self.worker_manager.workers.remove(pos);
                             self.push_log(format!(
                                 "アーカイブを削除しました: {}",
                                 worker.snapshot.name
@@ -756,7 +883,7 @@ impl App {
     fn enqueue_restart_worker(&mut self) {
         if let Some(id) = self.selected_worker_id() {
             // Check if this is an archived worker
-            if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == id) {
+            if let Some(worker) = self.worker_manager.workers.iter().find(|w| w.snapshot.id == id) {
                 if worker.snapshot.status == WorkerStatus::Archived {
                     self.push_log("アーカイブされたワーカーは再起動できません".to_string());
                     return;
@@ -770,97 +897,97 @@ impl App {
     }
 
     fn toggle_help(&mut self) {
-        self.show_help = !self.show_help;
+        self.ui_state.show_help = !self.ui_state.show_help;
     }
 
     fn toggle_logs(&mut self) {
-        self.show_logs = !self.show_logs;
+        self.ui_state.show_logs = !self.ui_state.show_logs;
         // Reset scroll and view mode when opening logs
-        if self.show_logs {
-            self.log_scroll = 0;
-            self.log_view_mode = LogViewMode::Overview;
-            self.selected_step = 0;
+        if self.ui_state.show_logs {
+            self.log_manager.log_scroll = 0;
+            self.ui_state.log_view_mode = LogViewMode::Overview;
+            self.ui_state.selected_step = 0;
             // Clamp selected_step to valid range
             if let Some(view) = self.selected_worker_view() {
                 if !view.structured_logs.is_empty() {
-                    self.selected_step = self.selected_step.min(view.structured_logs.len() - 1);
+                    self.ui_state.selected_step = self.ui_state.selected_step.min(view.structured_logs.len() - 1);
                 } else {
-                    self.selected_step = 0;
+                    self.ui_state.selected_step = 0;
                 }
             } else {
-                self.selected_step = 0;
+                self.ui_state.selected_step = 0;
             }
         }
     }
 
     fn scroll_log_up(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_sub(1);
+        self.log_manager.log_scroll = self.log_manager.log_scroll.saturating_sub(1);
         // Disable auto-scroll when manually scrolling up
-        self.auto_scroll_logs = false;
+        self.log_manager.auto_scroll_logs = false;
     }
 
     fn scroll_log_down(&mut self) {
         let max_scroll = self.get_log_max_scroll();
-        if self.log_scroll < max_scroll {
-            self.log_scroll += 1;
+        if self.log_manager.log_scroll < max_scroll {
+            self.log_manager.log_scroll += 1;
         }
         // Re-enable auto-scroll if we reached the bottom
-        if self.log_scroll >= max_scroll {
-            self.auto_scroll_logs = true;
+        if self.log_manager.log_scroll >= max_scroll {
+            self.log_manager.auto_scroll_logs = true;
         }
     }
 
     fn scroll_log_home(&mut self) {
-        self.log_scroll = 0;
+        self.log_manager.log_scroll = 0;
         // Disable auto-scroll when jumping to top
-        self.auto_scroll_logs = false;
+        self.log_manager.auto_scroll_logs = false;
     }
 
     fn scroll_log_end(&mut self) {
-        self.log_scroll = self.get_log_max_scroll();
+        self.log_manager.log_scroll = self.get_log_max_scroll();
         // Re-enable auto-scroll when jumping to bottom
-        self.auto_scroll_logs = true;
+        self.log_manager.auto_scroll_logs = true;
     }
 
     fn scroll_log_page_up(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_sub(10);
+        self.log_manager.log_scroll = self.log_manager.log_scroll.saturating_sub(10);
         // Disable auto-scroll when paging up
-        self.auto_scroll_logs = false;
+        self.log_manager.auto_scroll_logs = false;
     }
 
     fn scroll_log_page_down(&mut self) {
         let max_scroll = self.get_log_max_scroll();
-        let new_scroll = self.log_scroll.saturating_add(10);
-        self.log_scroll = new_scroll.min(max_scroll);
+        let new_scroll = self.log_manager.log_scroll.saturating_add(10);
+        self.log_manager.log_scroll = new_scroll.min(max_scroll);
         // Re-enable auto-scroll if we reached the bottom
-        if self.log_scroll >= max_scroll {
-            self.auto_scroll_logs = true;
+        if self.log_manager.log_scroll >= max_scroll {
+            self.log_manager.auto_scroll_logs = true;
         }
     }
 
     fn get_log_max_scroll(&self) -> usize {
-        match self.log_view_mode {
-            LogViewMode::Raw => self.log_messages.len().saturating_sub(1),
+        match self.ui_state.log_view_mode {
+            LogViewMode::Raw => self.log_manager.log_messages.len().saturating_sub(1),
             _ => {
                 if let Some(view) = self.selected_worker_view() {
                     view.logs.len().saturating_sub(1)
                 } else {
-                    self.log_messages.len().saturating_sub(1)
+                    self.log_manager.log_messages.len().saturating_sub(1)
                 }
             }
         }
     }
 
     fn compact_logs(&mut self) {
-        while self.log_messages.len() > 4 {
-            self.log_messages.pop_front();
+        while self.log_manager.log_messages.len() > 4 {
+            self.log_manager.log_messages.pop_front();
         }
         self.push_log("アクションログを圧縮しました".into());
     }
 
     fn toggle_auto_scroll(&mut self) {
-        self.auto_scroll_logs = !self.auto_scroll_logs;
-        let status = if self.auto_scroll_logs {
+        self.log_manager.auto_scroll_logs = !self.log_manager.auto_scroll_logs;
+        let status = if self.log_manager.auto_scroll_logs {
             "ON"
         } else {
             "OFF"
@@ -869,7 +996,7 @@ impl App {
     }
 
     fn switch_log_tab_next(&mut self) {
-        let next_mode = match self.log_view_mode {
+        let next_mode = match self.ui_state.log_view_mode {
             LogViewMode::Overview => LogViewMode::Detail,
             LogViewMode::Detail => LogViewMode::Raw,
             LogViewMode::Raw => LogViewMode::Overview,
@@ -880,18 +1007,18 @@ impl App {
             if let Some(view) = self.selected_worker_view() {
                 if !view.structured_logs.is_empty() {
                     // Clamp selected_step to valid range
-                    self.selected_step = self.selected_step.min(view.structured_logs.len() - 1);
-                    self.log_view_mode = next_mode;
+                    self.ui_state.selected_step = self.ui_state.selected_step.min(view.structured_logs.len() - 1);
+                    self.ui_state.log_view_mode = next_mode;
                 }
             }
         } else {
-            self.log_view_mode = next_mode;
+            self.ui_state.log_view_mode = next_mode;
         }
-        self.log_scroll = 0;
+        self.log_manager.log_scroll = 0;
     }
 
     fn switch_log_tab_prev(&mut self) {
-        let next_mode = match self.log_view_mode {
+        let next_mode = match self.ui_state.log_view_mode {
             LogViewMode::Overview => LogViewMode::Raw,
             LogViewMode::Raw => LogViewMode::Detail,
             LogViewMode::Detail => LogViewMode::Overview,
@@ -902,25 +1029,25 @@ impl App {
             if let Some(view) = self.selected_worker_view() {
                 if !view.structured_logs.is_empty() {
                     // Clamp selected_step to valid range
-                    self.selected_step = self.selected_step.min(view.structured_logs.len() - 1);
-                    self.log_view_mode = next_mode;
+                    self.ui_state.selected_step = self.ui_state.selected_step.min(view.structured_logs.len() - 1);
+                    self.ui_state.log_view_mode = next_mode;
                 }
             }
         } else {
-            self.log_view_mode = next_mode;
+            self.ui_state.log_view_mode = next_mode;
         }
-        self.log_scroll = 0;
+        self.log_manager.log_scroll = 0;
     }
 
     fn select_step_up(&mut self) {
-        self.selected_step = self.selected_step.saturating_sub(1);
+        self.ui_state.selected_step = self.ui_state.selected_step.saturating_sub(1);
     }
 
     fn select_step_down(&mut self) {
         if let Some(view) = self.selected_worker_view() {
             if !view.structured_logs.is_empty() {
                 let max = view.structured_logs.len() - 1;
-                self.selected_step = (self.selected_step + 1).min(max);
+                self.ui_state.selected_step = (self.ui_state.selected_step + 1).min(max);
             }
         }
     }
@@ -928,20 +1055,20 @@ impl App {
     fn enter_detail_from_overview(&mut self) {
         // Only enter detail if a valid step is selected
         if let Some(view) = self.selected_worker_view() {
-            if self.selected_step < view.structured_logs.len() {
-                self.log_view_mode = LogViewMode::Detail;
-                self.log_scroll = 0;
+            if self.ui_state.selected_step < view.structured_logs.len() {
+                self.ui_state.log_view_mode = LogViewMode::Detail;
+                self.log_manager.log_scroll = 0;
             }
         }
     }
 
     fn back_to_overview(&mut self) {
-        self.log_view_mode = LogViewMode::Overview;
-        self.log_scroll = 0;
+        self.ui_state.log_view_mode = LogViewMode::Overview;
+        self.log_manager.log_scroll = 0;
     }
 
     fn cycle_filter(&mut self) {
-        self.status_filter = match self.status_filter {
+        self.ui_state.status_filter = match self.ui_state.status_filter {
             None => Some(WorkerStatus::Running),
             Some(WorkerStatus::Running) => Some(WorkerStatus::Paused),
             Some(WorkerStatus::Paused) => Some(WorkerStatus::Failed),
@@ -950,7 +1077,7 @@ impl App {
             Some(WorkerStatus::Archived) => None,
         };
         self.push_log("ステータスフィルタを更新しました".into());
-        self.selected = 0;
+        self.ui_state.selected = 0;
         self.clamp_selection();
     }
 
@@ -972,7 +1099,7 @@ impl App {
     }
 
     fn show_create_selection(&mut self) {
-        self.input_mode = Some(InputMode::CreateWorkerSelection { selected: 0 });
+        self.ui_state.input_mode = Some(InputMode::CreateWorkerSelection { selected: 0 });
     }
 
     fn show_worktree_selection(&mut self) {
@@ -982,7 +1109,7 @@ impl App {
                     self.push_log("既存のworktreeが見つかりませんでした".to_string());
                     return;
                 }
-                self.input_mode = Some(InputMode::WorktreeSelection {
+                self.ui_state.input_mode = Some(InputMode::WorktreeSelection {
                     worktrees,
                     selected: 0,
                 });
@@ -1016,7 +1143,7 @@ impl App {
     }
 
     fn start_free_prompt(&mut self) {
-        self.input_mode = Some(InputMode::FreePrompt {
+        self.ui_state.input_mode = Some(InputMode::FreePrompt {
             buffer: String::new(),
             force_new: false,
             permission_mode: None,
@@ -1027,7 +1154,7 @@ impl App {
     fn start_interactive_prompt(&mut self) {
         // Get selected worker
         if let Some(worker_id) = self.selected_worker_id() {
-            if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == worker_id) {
+            if let Some(worker) = self.worker_manager.workers.iter().find(|w| w.snapshot.id == worker_id) {
                 // Check if archived
                 if worker.snapshot.status == WorkerStatus::Archived {
                     self.push_log(
@@ -1040,7 +1167,7 @@ impl App {
                 let worktree_path = self.repo_root.join(&worker.snapshot.worktree);
                 let worker_name = worker.snapshot.name.clone();
 
-                self.pending_interactive_mode = Some(InteractiveRequest {
+                self.ui_state.pending_interactive_mode = Some(InteractiveRequest {
                     worker_name,
                     worktree_path,
                 });
@@ -1066,10 +1193,10 @@ impl App {
         // Check if a worker is selected (only if not forcing new worker creation)
         if !force_new {
             let visible = self.visible_indices();
-            if !visible.is_empty() && self.selected < visible.len() {
+            if !visible.is_empty() && self.ui_state.selected < visible.len() {
                 // Worker is selected - send continuation to existing worker
-                let worker_index = visible[self.selected];
-                if let Some(worker) = self.workers.get(worker_index) {
+                let worker_index = visible[self.ui_state.selected];
+                if let Some(worker) = self.worker_manager.workers.get(worker_index) {
                     // Check if archived
                     if worker.snapshot.status == WorkerStatus::Archived {
                         self.push_log(
@@ -1121,7 +1248,7 @@ impl App {
     }
 
     fn submit_permission_decision(&mut self, decision: PermissionDecision) {
-        if let Some(prompt) = self.permission_prompt.take() {
+        if let Some(prompt) = self.worker_manager.permission_prompt.take() {
             if let Err(err) = self.manager.respond_permission(
                 prompt.worker_id,
                 prompt.request.request_id,
@@ -1132,7 +1259,7 @@ impl App {
                     format!("権限応答の送信に失敗しました: {err}"),
                 );
             } else {
-                self.permission_tracker.insert(
+                self.worker_manager.permission_tracker.insert(
                     prompt.request.request_id,
                     PermissionTrackerEntry {
                         worker_name: prompt.worker_name,
@@ -1151,7 +1278,7 @@ impl App {
         let mode_text = permission_mode_label(&request.permission_mode).to_string();
         let step_name = request.step_name.clone();
 
-        self.permission_prompt = Some(PermissionPromptState {
+        self.worker_manager.permission_prompt = Some(PermissionPromptState {
             worker_id: id,
             worker_name: worker_name.clone(),
             request,
@@ -1161,8 +1288,8 @@ impl App {
             },
         });
 
-        self.permission_tracker.insert(
-            self.permission_prompt
+        self.worker_manager.permission_tracker.insert(
+            self.worker_manager.permission_prompt
                 .as_ref()
                 .map(|prompt| prompt.request.request_id)
                 .unwrap(),
@@ -1195,13 +1322,13 @@ impl App {
         request_id: u64,
         decision: PermissionDecision,
     ) {
-        if let Some(current) = self.permission_prompt.as_ref() {
+        if let Some(current) = self.worker_manager.permission_prompt.as_ref() {
             if current.request.request_id == request_id {
-                self.permission_prompt = None;
+                self.worker_manager.permission_prompt = None;
             }
         }
 
-        let tracker = self.permission_tracker.remove(&request_id);
+        let tracker = self.worker_manager.permission_tracker.remove(&request_id);
         let worker_name = tracker
             .as_ref()
             .map(|entry| entry.worker_name.clone())
@@ -1224,58 +1351,51 @@ impl App {
         self.push_log_with_worker(Some(&worker_name), message);
     }
 
-    fn worker_name_by_id(&self, id: WorkerId) -> Option<String> {
-        self.workers
-            .iter()
-            .find(|view| view.snapshot.id == id)
-            .map(|view| view.snapshot.name.clone())
-    }
-
 
     fn select_next(&mut self) {
         let count = self.visible_indices().len();
         if count == 0 {
-            self.selected = 0;
+            self.ui_state.selected = 0;
             return;
         }
-        self.selected = (self.selected + 1).min(count.saturating_sub(1));
+        self.ui_state.selected = (self.ui_state.selected + 1).min(count.saturating_sub(1));
         // Reset log view state when switching workers
-        self.selected_step = 0;
-        self.log_scroll = 0;
+        self.ui_state.selected_step = 0;
+        self.log_manager.log_scroll = 0;
     }
 
     fn select_previous(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        if self.ui_state.selected > 0 {
+            self.ui_state.selected -= 1;
             // Reset log view state when switching workers
-            self.selected_step = 0;
-            self.log_scroll = 0;
+            self.ui_state.selected_step = 0;
+            self.log_manager.log_scroll = 0;
         }
     }
 
     fn select_first(&mut self) {
-        self.selected = 0;
+        self.ui_state.selected = 0;
         // Reset log view state when switching workers
-        self.selected_step = 0;
-        self.log_scroll = 0;
+        self.ui_state.selected_step = 0;
+        self.log_manager.log_scroll = 0;
     }
 
     fn select_last(&mut self) {
         let count = self.visible_indices().len();
         if count == 0 {
-            self.selected = 0;
+            self.ui_state.selected = 0;
         } else {
-            self.selected = count - 1;
+            self.ui_state.selected = count - 1;
         }
         // Reset log view state when switching workers
-        self.selected_step = 0;
-        self.log_scroll = 0;
+        self.ui_state.selected_step = 0;
+        self.log_manager.log_scroll = 0;
     }
 
     fn on_tick(&mut self) {
         self.poll_events();
         self.clamp_selection();
-        self.animation_frame = self.animation_frame.wrapping_add(1);
+        self.ui_state.animation_frame = self.ui_state.animation_frame.wrapping_add(1);
     }
 
     fn poll_events(&mut self) {
@@ -1301,13 +1421,13 @@ impl App {
                 WorkerEvent::Log { id, line } => {
                     self.add_worker_log(id, line);
                     // Auto-scroll to bottom when new log is added
-                    if self.auto_scroll_logs && self.show_logs {
-                        self.log_scroll = self.get_log_max_scroll();
+                    if self.log_manager.auto_scroll_logs && self.ui_state.show_logs {
+                        self.log_manager.log_scroll = self.get_log_max_scroll();
                     }
                 }
                 WorkerEvent::Deleted { id, message } => {
                     let worker_name = self
-                        .workers
+                        .worker_manager.workers
                         .iter()
                         .find(|view| view.snapshot.id == id)
                         .map(|view| view.snapshot.name.clone());
@@ -1328,7 +1448,7 @@ impl App {
                     if let Some(worker_id) = id {
                         self.add_worker_log(worker_id, format!("エラー: {message}"));
                         if let Some(name) = self
-                            .workers
+                            .worker_manager.workers
                             .iter()
                             .find(|view| view.snapshot.id == worker_id)
                             .map(|view| view.snapshot.name.clone())
@@ -1367,19 +1487,19 @@ impl App {
         self.render_table(frame, layout[1]);
         self.render_footer(frame, layout[2]);
 
-        if self.show_logs {
+        if self.ui_state.show_logs {
             self.render_log_modal(frame);
         }
 
-        if self.show_help {
+        if self.ui_state.show_help {
             self.render_modal(frame, 60, 50, "Help", self.help_lines());
         }
 
-        if let Some(prompt) = &self.permission_prompt {
+        if let Some(prompt) = &self.worker_manager.permission_prompt {
             self.render_permission_modal(frame, prompt);
         }
 
-        if let Some(input_mode) = &self.input_mode {
+        if let Some(input_mode) = &self.ui_state.input_mode {
             match input_mode {
                 InputMode::FreePrompt {
                     buffer,
@@ -1409,7 +1529,7 @@ impl App {
                     self.render_name_input_modal(frame, buffer, workflow_name);
                 }
                 InputMode::RenameWorker { buffer, worker_id } => {
-                    if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == *worker_id) {
+                    if let Some(worker) = self.worker_manager.workers.iter().find(|w| w.snapshot.id == *worker_id) {
                         self.render_rename_worker_modal(frame, buffer, &worker.snapshot.name);
                     }
                 }
@@ -1418,9 +1538,9 @@ impl App {
     }
 
     fn render_header(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let total = self.workers.len();
+        let total = self.worker_manager.workers.len();
         let filter_label = self
-            .status_filter
+            .ui_state.status_filter
             .map(|status| status.label().to_string())
             .unwrap_or_else(|| "All".into());
 
@@ -1437,15 +1557,15 @@ impl App {
         let visible = self.visible_indices();
         let workers_data: Vec<(usize, &WorkerSnapshot)> = visible
             .iter()
-            .map(|&idx| (idx, &self.workers[idx].snapshot))
+            .map(|&idx| (idx, &self.worker_manager.workers[idx].snapshot))
             .collect();
 
         render_table(
             frame,
             area,
             &workers_data,
-            self.selected,
-            self.animation_frame,
+            self.ui_state.selected,
+            self.ui_state.animation_frame,
         );
     }
 
@@ -1545,15 +1665,15 @@ impl App {
         let worker_logs = self.selected_worker_view().map(|view| &view.logs);
         let data = prepare_raw_log_data(
             worker_logs,
-            &self.log_messages,
-            self.log_scroll,
-            self.auto_scroll_logs,
+            &self.log_manager.log_messages,
+            self.log_manager.log_scroll,
+            self.log_manager.auto_scroll_logs,
         );
         (data.title, data.lines)
     }
 
     fn render_log_modal(&self, frame: &mut ratatui::Frame<'_>) {
-        match self.log_view_mode {
+        match self.ui_state.log_view_mode {
             LogViewMode::Overview => self.render_overview_tab(frame),
             LogViewMode::Detail => self.render_detail_tab(frame),
             LogViewMode::Raw => {
@@ -1568,8 +1688,8 @@ impl App {
             render_overview_tab(
                 frame,
                 &view.structured_logs,
-                self.selected_step,
-                self.auto_scroll_logs,
+                self.ui_state.selected_step,
+                self.log_manager.auto_scroll_logs,
             );
         } else {
             // Show action logs (no structured logs available)
@@ -1581,8 +1701,8 @@ impl App {
 
     fn render_detail_tab(&self, frame: &mut ratatui::Frame<'_>) {
         if let Some(view) = self.selected_worker_view() {
-            if let Some(entry) = view.structured_logs.get(self.selected_step) {
-                render_detail_tab(frame, entry, self.log_scroll, self.auto_scroll_logs);
+            if let Some(entry) = view.structured_logs.get(self.ui_state.selected_step) {
+                render_detail_tab(frame, entry, self.log_manager.log_scroll, self.log_manager.auto_scroll_logs);
             } else {
                 let area = centered_rect(80, 60, frame.area());
                 let lines = vec![Line::raw("選択されたステップが見つかりません。")];
@@ -1596,23 +1716,12 @@ impl App {
     }
 
     fn add_or_update_worker(&mut self, snapshot: WorkerSnapshot) {
-        if let Some(pos) = self
-            .workers
-            .iter()
-            .position(|view| view.snapshot.id == snapshot.id)
-        {
-            let view = &mut self.workers[pos];
-            view.update_snapshot(snapshot);
-        } else {
-            let view = WorkerView::new(snapshot);
-            self.workers.push(view);
-        }
+        self.worker_manager.add_or_update(snapshot);
         self.clamp_selection();
     }
 
     fn remove_worker(&mut self, id: WorkerId) {
-        if let Some(pos) = self.workers.iter().position(|view| view.snapshot.id == id) {
-            let view = self.workers.remove(pos);
+        if let Some(view) = self.worker_manager.remove(id) {
             if let Err(err) = self.state_store.delete_worker(&view.snapshot.name) {
                 eprintln!(
                     "Failed to delete worker state {}: {err}",
@@ -1624,32 +1733,33 @@ impl App {
     }
 
     fn add_worker_log(&mut self, id: WorkerId, line: String) {
-        if let Some(pos) = self.workers.iter().position(|view| view.snapshot.id == id) {
-            let view = &mut self.workers[pos];
-            view.push_log(line);
-        }
+        self.worker_manager.add_log(id, line);
+    }
+
+    fn worker_name_by_id(&self, id: WorkerId) -> Option<String> {
+        self.worker_manager.worker_name_by_id(id)
     }
 
     fn selected_worker_id(&self) -> Option<WorkerId> {
         let indices = self.visible_indices();
         indices
-            .get(self.selected)
-            .and_then(|idx| self.workers.get(*idx))
+            .get(self.ui_state.selected)
+            .and_then(|idx| self.worker_manager.workers.get(*idx))
             .map(|view| view.snapshot.id)
     }
 
     fn selected_worker_view(&self) -> Option<&WorkerView> {
         let indices = self.visible_indices();
         indices
-            .get(self.selected)
-            .and_then(|idx| self.workers.get(*idx))
+            .get(self.ui_state.selected)
+            .and_then(|idx| self.worker_manager.workers.get(*idx))
     }
 
     fn visible_indices(&self) -> Vec<usize> {
-        self.workers
+        self.worker_manager.workers
             .iter()
             .enumerate()
-            .filter(|(_, view)| match self.status_filter {
+            .filter(|(_, view)| match self.ui_state.status_filter {
                 None => true,
                 Some(status) => view.snapshot.status == status,
             })
@@ -1659,16 +1769,16 @@ impl App {
 
     fn clamp_selection(&mut self) {
         let count = self.visible_indices().len();
-        let old_selected = self.selected;
+        let old_selected = self.ui_state.selected;
         if count == 0 {
-            self.selected = 0;
-        } else if self.selected >= count {
-            self.selected = count - 1;
+            self.ui_state.selected = 0;
+        } else if self.ui_state.selected >= count {
+            self.ui_state.selected = count - 1;
         }
         // Reset log view state if worker selection changed
-        if old_selected != self.selected {
-            self.selected_step = 0;
-            self.log_scroll = 0;
+        if old_selected != self.ui_state.selected {
+            self.ui_state.selected_step = 0;
+            self.log_manager.log_scroll = 0;
         }
     }
 
@@ -1677,9 +1787,6 @@ impl App {
     }
 
     fn push_log_with_worker(&mut self, worker: Option<&str>, message: String) {
-        if self.log_messages.len() >= GLOBAL_LOG_CAPACITY {
-            self.log_messages.pop_front();
-        }
         let entry = ActionLogEntry {
             timestamp: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -1687,7 +1794,7 @@ impl App {
             message,
             worker: worker.map(|w| w.to_string()),
         };
-        self.log_messages.push_back(format_action_log(&entry));
+        self.log_manager.push(format_action_log(&entry), GLOBAL_LOG_CAPACITY);
         if let Err(err) = self.state_store.append_action_log(&entry) {
             eprintln!("Failed to persist action log: {err}");
         }
