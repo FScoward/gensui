@@ -1,5 +1,6 @@
 mod config;
 mod state;
+mod ui;
 mod worker;
 
 use std::collections::{HashMap, VecDeque};
@@ -14,12 +15,18 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::text::Line;
 
 use crate::config::{Config, Workflow};
 use crate::state::{ActionLogEntry, StateStore};
+use crate::ui::{
+    centered_rect, describe_allowed_tools, format_action_log, help_lines, permission_mode_label,
+    prepare_raw_log_data, render_create_selection_modal, render_detail_tab,
+    render_footer, render_header, render_log_modal, render_modal,
+    render_overview_tab, render_permission_modal, render_prompt_modal,
+    render_table, render_tool_selection_modal, render_worktree_selection_modal,
+    LogEntry, LogViewMode, StepStatus, AVAILABLE_TOOLS,
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use worker::{
     CreateWorkerRequest, ExistingWorktree, PermissionDecision, PermissionRequest, WorkerEvent,
@@ -28,47 +35,6 @@ use worker::{
 };
 
 const GLOBAL_LOG_CAPACITY: usize = 64;
-
-// Available tools for Claude Code
-struct ToolDef {
-    name: &'static str,
-    description: &'static str,
-}
-
-const AVAILABLE_TOOLS: &[ToolDef] = &[
-    ToolDef {
-        name: "Read",
-        description: "ファイル読み取り",
-    },
-    ToolDef {
-        name: "Write",
-        description: "ファイル書き込み",
-    },
-    ToolDef {
-        name: "Edit",
-        description: "ファイル編集",
-    },
-    ToolDef {
-        name: "Glob",
-        description: "ファイル検索",
-    },
-    ToolDef {
-        name: "Grep",
-        description: "コード検索",
-    },
-    ToolDef {
-        name: "Bash",
-        description: "シェルコマンド実行",
-    },
-    ToolDef {
-        name: "WebFetch",
-        description: "Web取得",
-    },
-    ToolDef {
-        name: "NotebookEdit",
-        description: "Jupyter編集",
-    },
-];
 
 fn main() -> Result<()> {
     enable_raw_mode()?;
@@ -1036,7 +1002,7 @@ impl App {
         let worker_name = self
             .worker_name_by_id(id)
             .unwrap_or_else(|| format!("worker-{}", id.0));
-        let tools_text = Self::describe_allowed_tools(&request.allowed_tools);
+        let tools_text = describe_allowed_tools(&request.allowed_tools);
         let mode_text = permission_mode_label(&request.permission_mode).to_string();
         let step_name = request.step_name.clone();
 
@@ -1120,13 +1086,6 @@ impl App {
             .map(|view| view.snapshot.name.clone())
     }
 
-    fn describe_allowed_tools(tools: &Option<Vec<String>>) -> String {
-        match tools {
-            None => "制限なし".to_string(),
-            Some(list) if list.is_empty() => "なし".to_string(),
-            Some(list) => list.join(", "),
-        }
-    }
 
     fn select_next(&mut self) {
         let count = self.visible_indices().len();
@@ -1306,234 +1265,33 @@ impl App {
             .map(|status| status.label().to_string())
             .unwrap_or_else(|| "All".into());
 
-        let line = Line::from(vec![
-            Span::styled(
-                "Gensui",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" – multi-worker dashboard  "),
-            Span::raw(format!(
-                "Workers: {}  Filter: {}  Workflow: {}",
-                total,
-                filter_label,
-                self.current_workflow_name()
-            )),
-        ]);
-
-        let header =
-            Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("Overview"));
-        frame.render_widget(header, area);
+        render_header(
+            frame,
+            area,
+            total,
+            &filter_label,
+            self.current_workflow_name(),
+        );
     }
 
     fn render_table(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let visible = self.visible_indices();
-        let rows = visible.iter().enumerate().map(|(table_idx, worker_idx)| {
-            let worker = &self.workers[*worker_idx];
+        let workers_data: Vec<(usize, &WorkerSnapshot)> = visible
+            .iter()
+            .map(|&idx| (idx, &self.workers[idx].snapshot))
+            .collect();
 
-            // For Running status, don't apply row-level color so cell colors show through
-            let mut style = if worker.snapshot.status == WorkerStatus::Running {
-                Style::default()
-            } else {
-                Style::default().fg(status_color(worker.snapshot.status))
-            };
-
-            if table_idx == self.selected {
-                // For Running workers, only set background (not foreground) to preserve rainbow colors
-                if worker.snapshot.status == WorkerStatus::Running {
-                    style = style.bg(Color::DarkGray);
-                } else {
-                    style = style.bg(Color::DarkGray).fg(Color::White);
-                }
-            }
-
-            // Add spinner and rainbow gradient animation for Running status
-            const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            const RAINBOW_COLORS: &[Color] = &[
-                Color::Red,
-                Color::LightRed,
-                Color::Yellow,
-                Color::LightYellow,
-                Color::Green,
-                Color::LightGreen,
-                Color::Cyan,
-                Color::LightCyan,
-                Color::Blue,
-                Color::LightBlue,
-                Color::Magenta,
-                Color::LightMagenta,
-            ];
-
-            // Animate per-character colors for Running status (left-to-right flow)
-            let (name_cell, status_cell, last_event_cell) =
-                if worker.snapshot.status == WorkerStatus::Running {
-                    let spinner_idx = self.animation_frame % SPINNER_CHARS.len();
-                    let spinner = SPINNER_CHARS[spinner_idx];
-
-                    // Faster animation for smooth flow
-                    let slow_frame = self.animation_frame / 3;
-
-                    let is_selected = table_idx == self.selected;
-
-                    // Helper function to create rainbow text with per-character colors
-                    let create_rainbow_line = |text: &str| -> Vec<Span> {
-                        if text.is_empty() {
-                            return vec![Span::raw("")];
-                        }
-
-                        let mut spans = Vec::new();
-                        let chars_vec: Vec<char> = text.chars().collect();
-                        for (char_idx, ch) in chars_vec.iter().enumerate() {
-                            let color_idx = (slow_frame + char_idx / 2) % RAINBOW_COLORS.len();
-                            let color = RAINBOW_COLORS[color_idx];
-                            let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-                            if is_selected {
-                                style = style.bg(Color::DarkGray);
-                            }
-                            spans.push(Span::styled(ch.to_string(), style));
-                        }
-                        spans
-                    };
-
-                    let status_text = format!("{} {}", spinner, worker.snapshot.status.label());
-                    let sparkles = &["✨", "💫", "⭐", "🌟"];
-                    let sparkle_idx = (self.animation_frame / 10) % sparkles.len();
-                    let sparkle = sparkles[sparkle_idx];
-
-                    // For last_event, add sparkle as separate span to avoid emoji breakage
-                    let sparkle_style = if is_selected {
-                        Style::default().bg(Color::DarkGray)
-                    } else {
-                        Style::default()
-                    };
-                    let mut last_event_spans =
-                        vec![Span::styled(format!("{} ", sparkle), sparkle_style)];
-                    last_event_spans.extend(create_rainbow_line(&worker.snapshot.last_event));
-
-                    (
-                        Cell::from(Line::from(create_rainbow_line(&worker.snapshot.name))),
-                        Cell::from(Line::from(create_rainbow_line(&status_text))),
-                        Cell::from(Line::from(last_event_spans)),
-                    )
-                } else {
-                    (
-                        Cell::from(worker.snapshot.name.clone()),
-                        Cell::from(worker.snapshot.status.label()),
-                        Cell::from(worker.snapshot.last_event.clone()),
-                    )
-                };
-
-            // For Running workers that are selected, apply background to all cells
-            let other_cell_style =
-                if worker.snapshot.status == WorkerStatus::Running && table_idx == self.selected {
-                    Style::default().bg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
-
-            let row = Row::new(vec![
-                name_cell,
-                Cell::from(
-                    worker
-                        .snapshot
-                        .issue
-                        .clone()
-                        .unwrap_or_else(|| "Unassigned".into()),
-                )
-                .style(other_cell_style),
-                Cell::from(worker.snapshot.workflow.clone()).style(other_cell_style),
-                Cell::from(worker.snapshot.current_step.clone().unwrap_or_else(|| {
-                    if worker.snapshot.total_steps > 0 {
-                        format!("0/{} steps", worker.snapshot.total_steps)
-                    } else {
-                        "-".into()
-                    }
-                }))
-                .style(other_cell_style),
-                Cell::from(worker.snapshot.agent.clone()).style(other_cell_style),
-                Cell::from(worker.snapshot.worktree.clone()).style(other_cell_style),
-                Cell::from(worker.snapshot.branch.clone()).style(other_cell_style),
-                status_cell,
-                last_event_cell,
-            ]);
-
-            // Only apply row style for non-Running status (to preserve rainbow colors)
-            if worker.snapshot.status == WorkerStatus::Running {
-                row
-            } else {
-                row.style(style)
-            }
-        });
-
-        let header = Row::new(vec![
-            Cell::from("NAME"),
-            Cell::from("ISSUE"),
-            Cell::from("WORKFLOW"),
-            Cell::from("STEP"),
-            Cell::from("AGENT"),
-            Cell::from("WORKTREE"),
-            Cell::from("BRANCH"),
-            Cell::from("STATUS"),
-            Cell::from("LAST EVENT"),
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD));
-
-        let widths = [
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(14),
-            Constraint::Length(18),
-            Constraint::Length(20),
-            Constraint::Length(24),
-            Constraint::Length(20),
-            Constraint::Length(10),
-            Constraint::Min(24),
-        ];
-
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title("Workers"))
-            .column_spacing(1)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-
-        frame.render_widget(table, area);
+        render_table(
+            frame,
+            area,
+            &workers_data,
+            self.selected,
+            self.animation_frame,
+        );
     }
 
     fn render_footer(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("q", Style::default().fg(Color::Cyan)),
-                Span::raw(" quit  "),
-                Span::styled("c", Style::default().fg(Color::Cyan)),
-                Span::raw(" create  "),
-                Span::styled("d", Style::default().fg(Color::Cyan)),
-                Span::raw(" delete  "),
-                Span::styled("r", Style::default().fg(Color::Cyan)),
-                Span::raw(" restart  "),
-                Span::styled("a", Style::default().fg(Color::Cyan)),
-                Span::raw(" filter  "),
-                Span::styled("w", Style::default().fg(Color::Cyan)),
-                Span::raw(" workflow  "),
-                Span::styled("h", Style::default().fg(Color::Cyan)),
-                Span::raw(" help  "),
-                Span::styled("l", Style::default().fg(Color::Cyan)),
-                Span::raw(" logs"),
-            ]),
-            Line::from(vec![
-                Span::styled("i", Style::default().fg(Color::Cyan)),
-                Span::raw(": send prompt (or continue if worker selected) | "),
-                Span::raw("Active workflow: "),
-                Span::styled(
-                    self.current_workflow_name(),
-                    Style::default().fg(Color::Magenta),
-                ),
-            ]),
-        ];
-
-        let footer =
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Controls"));
-        frame.render_widget(footer, area);
+        render_footer(frame, area, self.current_workflow_name());
     }
 
     fn render_modal(
@@ -1545,11 +1303,7 @@ impl App {
         lines: Vec<Line>,
     ) {
         let area = centered_rect(percent_x, percent_y, frame.area());
-        let widget = Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(title));
-        frame.render_widget(Clear, area);
-        frame.render_widget(widget, area);
+        render_modal(frame, area, title, lines);
     }
 
     fn render_prompt_modal(
@@ -1559,39 +1313,7 @@ impl App {
         permission_mode: &Option<String>,
     ) {
         let area = centered_rect(70, 30, frame.area());
-        let mode_str = permission_mode_label(permission_mode);
-        let mode_color = match permission_mode.as_deref() {
-            Some("plan") => Color::Cyan,
-            Some("acceptEdits") => Color::Yellow,
-            _ => Color::Green,
-        };
-
-        let lines = vec![
-            Line::raw(
-                "自由指示を入力してください (Enterで送信 / Escでキャンセル / Ctrl+Pでモード切替)",
-            ),
-            Line::raw(""),
-            Line::from(Span::styled(
-                buffer,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::raw(""),
-            Line::from(vec![
-                Span::raw("モード: "),
-                Span::styled(
-                    mode_str,
-                    Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::raw("Claude Codeがheadlessモードで実行されます"),
-        ];
-        let widget = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("Free Prompt"));
-        frame.render_widget(Clear, area);
-        frame.render_widget(widget, area);
+        render_prompt_modal(frame, area, buffer, permission_mode);
     }
 
     fn render_permission_modal(
@@ -1600,123 +1322,19 @@ impl App {
         prompt: &PermissionPromptState,
     ) {
         let area = centered_rect(70, 45, frame.area());
-        let mode_label = permission_mode_label(&prompt.request.permission_mode).to_string();
-        let tools_text = Self::describe_allowed_tools(&prompt.request.allowed_tools);
-        let description = prompt
-            .request
-            .description
-            .as_deref()
-            .unwrap_or("このステップに進む前に権限が必要です");
-
-        let mut lines = Vec::new();
-        lines.push(Line::from(vec![Span::styled(
-            "権限確認",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::raw("ワーカー: "),
-            Span::styled(&prompt.worker_name, Style::default().fg(Color::Cyan)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("ステップ: "),
-            Span::styled(&prompt.request.step_name, Style::default().fg(Color::Green)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("説明: "),
-            Span::raw(description),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("権限モード: "),
-            Span::styled(mode_label, Style::default().fg(Color::Yellow)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("許可ツール: "),
-            Span::styled(tools_text, Style::default().fg(Color::Cyan)),
-        ]));
-        lines.push(Line::raw(""));
-
-        let options = [
-            (
-                PermissionDecision::Allow {
-                    permission_mode: None,
-                    allowed_tools: None,
-                },
-                "許可する",
-            ),
-            (PermissionDecision::Deny, "拒否する"),
-        ];
-
-        let mut option_spans = Vec::new();
-        for (idx, (decision, label)) in options.iter().enumerate() {
-            if idx > 0 {
-                option_spans.push(Span::raw("    "));
-            }
-            let is_selected = decision == &prompt.selection;
-            let style = if is_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            option_spans.push(Span::styled(*label, style));
-        }
-        lines.push(Line::from(option_spans));
-        lines.push(Line::raw(""));
-        lines.push(Line::raw("←/→ で切替 • Enter/ Y = 許可 • Esc/ N = 拒否"));
-
-        let widget = Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("Permission"));
-
-        frame.render_widget(Clear, area);
-        frame.render_widget(widget, area);
+        render_permission_modal(
+            frame,
+            area,
+            &prompt.worker_name,
+            &prompt.request,
+            &prompt.selection,
+        );
     }
 
     fn render_create_selection_modal(&self, frame: &mut ratatui::Frame<'_>, selected: usize) {
         let area = centered_rect(60, 40, frame.area());
-
         let workflow_name = self.current_workflow_name();
-        let options = vec![
-            format!("  ワークフローを実行 ({})", workflow_name),
-            "  自由入力でワーカーを作成".to_string(),
-            "  既存worktreeを使用".to_string(),
-        ];
-
-        let lines: Vec<Line> = vec![
-            Line::raw("ワーカーの作成方法を選択してください"),
-            Line::raw(""),
-        ]
-        .into_iter()
-        .chain(options.iter().enumerate().map(|(i, opt)| {
-            if i == selected {
-                Line::from(Span::styled(
-                    format!("> {}", opt),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(opt.clone())
-            }
-        }))
-        .chain(vec![
-            Line::raw(""),
-            Line::raw("↑↓: 選択移動  Enter: 決定  Esc: キャンセル"),
-        ])
-        .collect();
-
-        let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Create Worker"),
-        );
-        frame.render_widget(Clear, area);
-        frame.render_widget(widget, area);
+        render_create_selection_modal(frame, area, selected, workflow_name);
     }
 
     fn render_tool_selection_modal(
@@ -1727,69 +1345,7 @@ impl App {
         permission_mode: &str,
     ) {
         let area = centered_rect(70, 60, frame.area());
-
-        let mut lines = vec![
-            Line::from(Span::styled(
-                "ツール選択",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::raw(""),
-            Line::raw("↑/↓: 移動  Space: 切替  Enter: 決定  Esc: キャンセル"),
-            Line::raw(""),
-        ];
-
-        // Render tool checkboxes
-        for (idx, tool_def) in AVAILABLE_TOOLS.iter().enumerate() {
-            let checked = tools.get(tool_def.name).copied().unwrap_or(false);
-            let checkbox = if checked { "[✓]" } else { "[ ]" };
-            let text = format!("{} {}  - {}", checkbox, tool_def.name, tool_def.description);
-
-            let line = if idx == selected_idx {
-                Line::from(Span::styled(
-                    format!("> {}", text),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(text)
-            };
-            lines.push(line);
-        }
-
-        lines.push(Line::raw(""));
-
-        // Render permission_mode selector
-        let mode_text = format!(
-            "Permission Mode: {}",
-            match permission_mode {
-                "acceptEdits" => "acceptEdits (編集承認)",
-                "bypassPermissions" => "bypassPermissions (制限なし)",
-                _ => permission_mode,
-            }
-        );
-        let mode_line = if selected_idx == AVAILABLE_TOOLS.len() {
-            Line::from(Span::styled(
-                format!("> {} (Space で切替)", mode_text),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Line::from(mode_text)
-        };
-        lines.push(mode_line);
-
-        let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Tool Selection"),
-        );
-
-        frame.render_widget(Clear, area);
-        frame.render_widget(widget, area);
+        render_tool_selection_modal(frame, area, tools, selected_idx, permission_mode);
     }
 
     fn render_worktree_selection_modal(
@@ -1799,110 +1355,22 @@ impl App {
         selected: usize,
     ) {
         let area = centered_rect(70, 50, frame.area());
-
-        let lines: Vec<Line> = vec![Line::raw("既存のworktreeを選択してください"), Line::raw("")]
-            .into_iter()
-            .chain(worktrees.iter().enumerate().map(|(i, wt)| {
-                let display_text = format!("  {} (branch: {})", wt.path.display(), wt.branch);
-                if i == selected {
-                    Line::from(Span::styled(
-                        format!("> {}", display_text),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(display_text)
-                }
-            }))
-            .chain(vec![
-                Line::raw(""),
-                Line::raw("↑↓: 選択移動  Enter: 決定  Esc: キャンセル"),
-            ])
-            .collect();
-
-        let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Select Worktree"),
-        );
-        frame.render_widget(Clear, area);
-        frame.render_widget(widget, area);
+        render_worktree_selection_modal(frame, area, worktrees, selected);
     }
 
     fn help_lines(&self) -> Vec<Line<'static>> {
-        vec![
-            Line::raw("MVP ショートカット"),
-            Line::raw(""),
-            Line::raw("c – ワーカーを作成（ワークフロー or 自由入力を選択）"),
-            Line::raw("d – ワーカー停止と worktree 削除（アーカイブは状態削除のみ）"),
-            Line::raw("r – ワーカーを再起動（アーカイブは不可）"),
-            Line::raw("i – 自由指示を送信（ワーカー選択時は追加指示、アーカイブは不可）"),
-            Line::raw("a – ステータスフィルタを切り替え"),
-            Line::raw("w – 使用するワークフローを切り替え"),
-            Line::raw("j/k または ↑/↓ – 選択移動 (ログ表示時はスクロール)"),
-            Line::raw("PgUp/PgDn – ログを10行スクロール"),
-            Line::raw("Home/End – ログの先頭/末尾へジャンプ"),
-            Line::raw("l – 選択ワーカーのログを表示"),
-            Line::raw("h – このヘルプを表示"),
-            Line::raw("Shift+C – アクションログを圧縮"),
-            Line::raw("Shift+I – インタラクティブClaude Code起動（権限を手動承認可能）"),
-            Line::raw("Shift+A – ログの自動スクロールON/OFF切替"),
-            Line::raw("q – 終了"),
-            Line::raw(""),
-            Line::raw("ステータス: Running/Idle/Paused/Failed/Archived(青=履歴)"),
-        ]
+        help_lines()
     }
 
     fn log_modal_data(&self) -> (String, Vec<Line<'static>>) {
-        let (all_lines, base_title): (Vec<String>, &str) =
-            if let Some(view) = self.selected_worker_view() {
-                if view.logs.is_empty() {
-                    (
-                        vec!["このワーカーのログはまだありません。".to_string()],
-                        "Worker Logs",
-                    )
-                } else {
-                    (view.logs.iter().cloned().collect(), "Worker Logs")
-                }
-            } else if self.log_messages.is_empty() {
-                (
-                    vec!["アクションログはまだありません。".to_string()],
-                    "Action Logs",
-                )
-            } else {
-                (self.log_messages.iter().cloned().collect(), "Action Logs")
-            };
-
-        let total_lines = all_lines.len();
-        let visible_start = self.log_scroll.min(total_lines.saturating_sub(1));
-
-        // Show lines from scroll position onwards
-        let visible_lines: Vec<Line<'static>> = all_lines
-            .iter()
-            .skip(visible_start)
-            .map(|s| Line::from(s.clone()))
-            .collect();
-
-        let auto_scroll_status = if self.auto_scroll_logs {
-            "[Auto-scroll: ON]"
-        } else {
-            "[Auto-scroll: OFF]"
-        };
-
-        let title = if total_lines > 1 {
-            format!(
-                "{} (line {}/{}) {} [↑↓:scroll PgUp/PgDn:page Home/End:jump Shift+A:toggle]",
-                base_title,
-                visible_start + 1,
-                total_lines,
-                auto_scroll_status
-            )
-        } else {
-            format!("{} {}", base_title, auto_scroll_status)
-        };
-
-        (title, visible_lines)
+        let worker_logs = self.selected_worker_view().map(|view| &view.logs);
+        let data = prepare_raw_log_data(
+            worker_logs,
+            &self.log_messages,
+            self.log_scroll,
+            self.auto_scroll_logs,
+        );
+        (data.title, data.lines)
     }
 
     fn render_log_modal(&self, frame: &mut ratatui::Frame<'_>) {
@@ -1917,199 +1385,34 @@ impl App {
     }
 
     fn render_overview_tab(&self, frame: &mut ratatui::Frame<'_>) {
-        let area = centered_rect(80, 60, frame.area());
-
         if let Some(view) = self.selected_worker_view() {
-            let entries = &view.structured_logs;
-
-            if entries.is_empty() {
-                let lines = vec![Line::raw("このワーカーにはまだステップログがありません。")];
-                let auto_scroll_status = if self.auto_scroll_logs {
-                    "[Auto-scroll: ON]"
-                } else {
-                    "[Auto-scroll: OFF]"
-                };
-                let title = format!("Overview {} [Tab:switch tabs Shift+A:toggle]", auto_scroll_status);
-                let widget = Paragraph::new(lines)
-                    .block(Block::default().borders(Borders::ALL).title(title));
-                frame.render_widget(Clear, area);
-                frame.render_widget(widget, area);
-                return;
-            }
-
-            // Clamp selected_step to valid range to prevent panic
-            let safe_selected_step = self.selected_step.min(entries.len().saturating_sub(1));
-
-            // Build table rows
-            let header = Row::new(vec![
-                Cell::from("#"),
-                Cell::from("Step"),
-                Cell::from("Status"),
-                Cell::from("Summary"),
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .bottom_margin(1);
-
-            // Add status and summary processing with safe string slicing
-            let rows: Vec<Row> = entries
-                .iter()
-                .enumerate()
-                .map(|(idx, entry)| {
-                    let status_str = match entry.status {
-                        StepStatus::Running => "Running",
-                        StepStatus::Success => "✓ Success",
-                        StepStatus::Failed => "✗ Failed",
-                    };
-
-                    // Safe string truncation using chars instead of byte slicing
-                    let (summary_source, prefix) =
-                        if let Some(first_thought) = entry.thought_lines.first() {
-                            (first_thought.clone(), "🤔 ")
-                        } else if let Some(first_result) = entry.result_lines.first() {
-                            (first_result.clone(), "")
-                        } else {
-                            ("(no result)".to_string(), "")
-                        };
-
-                    let summary_body = {
-                        let chars: Vec<char> = summary_source.chars().collect();
-                        if chars.len() > 60 {
-                            let truncated: String = chars.iter().take(60).collect();
-                            format!("{}...", truncated)
-                        } else {
-                            summary_source
-                        }
-                    };
-                    let summary = format!("{}{}", prefix, summary_body);
-
-                    let style = if idx == safe_selected_step {
-                        Style::default().bg(Color::DarkGray)
-                    } else {
-                        Style::default()
-                    };
-
-                    Row::new(vec![
-                        Cell::from(format!("{}", entry.step_index)),
-                        Cell::from(entry.step_name.clone()),
-                        Cell::from(status_str),
-                        Cell::from(summary),
-                    ])
-                    .style(style)
-                })
-                .collect();
-
-            let widths = [
-                Constraint::Length(4),
-                Constraint::Length(20),
-                Constraint::Length(12),
-                Constraint::Min(30),
-            ];
-
-            let auto_scroll_status = if self.auto_scroll_logs {
-                "[Auto-scroll: ON]"
-            } else {
-                "[Auto-scroll: OFF]"
-            };
-            let title = format!(
-                "Overview {} [Tab:switch tabs | Enter:detail | j/k:select | Shift+A:toggle]",
-                auto_scroll_status
+            render_overview_tab(
+                frame,
+                &view.structured_logs,
+                self.selected_step,
+                self.auto_scroll_logs,
             );
-
-            let table = Table::new(rows, widths).header(header).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title),
-            );
-
-            frame.render_widget(Clear, area);
-            frame.render_widget(table, area);
         } else {
             // Show action logs (no structured logs available)
+            let area = centered_rect(80, 60, frame.area());
             let (title, lines) = self.log_modal_data();
-            let widget =
-                Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
-            frame.render_widget(Clear, area);
-            frame.render_widget(widget, area);
+            render_log_modal(frame, area, &title, lines);
         }
     }
 
     fn render_detail_tab(&self, frame: &mut ratatui::Frame<'_>) {
-        let area = centered_rect(80, 60, frame.area());
-
         if let Some(view) = self.selected_worker_view() {
             if let Some(entry) = view.structured_logs.get(self.selected_step) {
-                let mut lines = Vec::new();
-
-                // Title
-                lines.push(Line::from(format!(
-                    "Step #{}: {}",
-                    entry.step_index, entry.step_name
-                )));
-                lines.push(Line::raw(""));
-
-                // Prompt section
-                lines.push(Line::from(Span::styled(
-                    "─── Prompt ───",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                for line in &entry.prompt_lines {
-                    lines.push(Line::from(line.clone()));
-                }
-                lines.push(Line::raw(""));
-
-                if !entry.thought_lines.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "─── Thought ───",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    for line in &entry.thought_lines {
-                        lines.push(Line::from(line.clone()));
-                    }
-                    lines.push(Line::raw(""));
-                }
-
-                // Result section
-                lines.push(Line::from(Span::styled(
-                    "─── Result ───",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                for line in &entry.result_lines {
-                    lines.push(Line::from(line.clone()));
-                }
-
-                let visible_lines: Vec<Line> =
-                    lines.iter().skip(self.log_scroll).cloned().collect();
-
-                let auto_scroll_status = if self.auto_scroll_logs {
-                    "[Auto-scroll: ON]"
-                } else {
-                    "[Auto-scroll: OFF]"
-                };
-                let title = format!(
-                    "Detail - Step {} {} [Tab:switch tabs | Esc:back | ↑↓:scroll | Shift+A:toggle]",
-                    entry.step_index,
-                    auto_scroll_status
-                );
-
-                let widget = Paragraph::new(visible_lines)
-                    .block(Block::default().borders(Borders::ALL).title(title))
-                    .wrap(Wrap { trim: false });
-
-                frame.render_widget(Clear, area);
-                frame.render_widget(widget, area);
+                render_detail_tab(frame, entry, self.log_scroll, self.auto_scroll_logs);
             } else {
+                let area = centered_rect(80, 60, frame.area());
                 let lines = vec![Line::raw("選択されたステップが見つかりません。")];
-                let widget = Paragraph::new(lines)
-                    .block(Block::default().borders(Borders::ALL).title("Detail"));
-                frame.render_widget(Clear, area);
-                frame.render_widget(widget, area);
+                render_log_modal(frame, area, "Detail", lines);
             }
         } else {
+            let area = centered_rect(80, 60, frame.area());
             let lines = vec![Line::raw("ワーカーが選択されていません。")];
-            let widget =
-                Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Detail"));
-            frame.render_widget(Clear, area);
-            frame.render_widget(widget, area);
+            render_log_modal(frame, area, "Detail", lines);
         }
     }
 
@@ -2234,29 +1537,6 @@ struct WorkerView {
     in_thought: bool,
 }
 
-#[derive(Debug, Clone)]
-struct LogEntry {
-    step_index: usize,
-    step_name: String,
-    prompt_lines: Vec<String>,
-    result_lines: Vec<String>,
-    thought_lines: Vec<String>,
-    status: StepStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StepStatus {
-    Running,
-    Success,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogViewMode {
-    Overview,
-    Detail,
-    Raw,
-}
 
 impl WorkerView {
     const LOG_CAPACITY: usize = 128;
@@ -2437,55 +1717,3 @@ struct PermissionTrackerEntry {
     step_name: String,
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage((100 - percent_y) / 2),
-                Constraint::Percentage(percent_y),
-                Constraint::Percentage((100 - percent_y) / 2),
-            ]
-            .as_ref(),
-        )
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage((100 - percent_x) / 2),
-                Constraint::Percentage(percent_x),
-                Constraint::Percentage((100 - percent_x) / 2),
-            ]
-            .as_ref(),
-        )
-        .split(vertical[1])[1]
-}
-
-fn format_action_log(entry: &ActionLogEntry) -> String {
-    match &entry.worker {
-        Some(worker) => format!("[{}][{}] {}", entry.timestamp, worker, entry.message),
-        None => format!("[{}] {}", entry.timestamp, entry.message),
-    }
-}
-
-fn status_color(status: WorkerStatus) -> Color {
-    match status {
-        WorkerStatus::Running => Color::Green,
-        WorkerStatus::Paused => Color::Yellow,
-        WorkerStatus::Failed => Color::Red,
-        WorkerStatus::Idle => Color::Gray,
-        WorkerStatus::Archived => Color::Blue,
-    }
-}
-
-fn permission_mode_label(permission_mode: &Option<String>) -> &str {
-    match permission_mode.as_deref() {
-        None => "制限なしモード",
-        Some("plan") => "プランモード",
-        Some("acceptEdits") => "編集承認モード",
-        Some("bypassPermissions") => "制限なしモード",
-        Some(other) => other,
-    }
-}
