@@ -29,6 +29,47 @@ use worker::{
 
 const GLOBAL_LOG_CAPACITY: usize = 64;
 
+// Available tools for Claude Code
+struct ToolDef {
+    name: &'static str,
+    description: &'static str,
+}
+
+const AVAILABLE_TOOLS: &[ToolDef] = &[
+    ToolDef {
+        name: "Read",
+        description: "ファイル読み取り",
+    },
+    ToolDef {
+        name: "Write",
+        description: "ファイル書き込み",
+    },
+    ToolDef {
+        name: "Edit",
+        description: "ファイル編集",
+    },
+    ToolDef {
+        name: "Glob",
+        description: "ファイル検索",
+    },
+    ToolDef {
+        name: "Grep",
+        description: "コード検索",
+    },
+    ToolDef {
+        name: "Bash",
+        description: "シェルコマンド実行",
+    },
+    ToolDef {
+        name: "WebFetch",
+        description: "Web取得",
+    },
+    ToolDef {
+        name: "NotebookEdit",
+        description: "Jupyter編集",
+    },
+];
+
 fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -151,6 +192,7 @@ struct App {
     permission_prompt: Option<PermissionPromptState>,
     permission_tracker: HashMap<u64, PermissionTrackerEntry>,
     pending_interactive_mode: Option<InteractiveRequest>,
+    auto_scroll_logs: bool,
 }
 
 struct InteractiveRequest {
@@ -217,36 +259,77 @@ impl App {
             permission_prompt: None,
             permission_tracker: HashMap::new(),
             pending_interactive_mode: None,
+            auto_scroll_logs: true,
         })
     }
 
     fn handle_key(&mut self, key_event: KeyEvent) -> bool {
-        if let Some(prompt) = self.permission_prompt.as_mut() {
-            match key_event.code {
-                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                    if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key_event.modifiers.contains(KeyModifiers::ALT)
-                    {
-                        prompt.toggle();
+        if self.permission_prompt.is_some() {
+            let key_code = key_event.code;
+
+            let mut should_submit = None;
+
+            if let Some(prompt) = self.permission_prompt.as_mut() {
+                match key_code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key_event.modifiers.contains(KeyModifiers::ALT)
+                        {
+                            prompt.toggle();
+                        }
+                    }
+                    KeyCode::Char('y') if key_event.modifiers.is_empty() => {
+                        should_submit = Some(PermissionDecision::Allow {
+                            permission_mode: None,
+                            allowed_tools: None,
+                        });
+                    }
+                    KeyCode::Char('n') if key_event.modifiers.is_empty() => {
+                        should_submit = Some(PermissionDecision::Deny);
+                    }
+                    KeyCode::Enter => {
+                        should_submit = Some(prompt.selection.clone());
+                    }
+                    KeyCode::Esc => {
+                        should_submit = Some(PermissionDecision::Deny);
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(decision) = should_submit {
+                // If Allow, open tool selection modal
+                match decision {
+                    PermissionDecision::Allow { .. } => {
+                        // Initialize tool selection with all tools unchecked
+                        let mut tools = HashMap::new();
+                        for tool_def in AVAILABLE_TOOLS {
+                            tools.insert(tool_def.name.to_string(), false);
+                        }
+
+                        // Save worker_id and request_id before clearing permission_prompt
+                        if let Some(prompt_state) = &self.permission_prompt {
+                            let worker_id = prompt_state.worker_id;
+                            let request_id = prompt_state.request.request_id;
+
+                            // Clear permission_prompt to allow tool selection modal to receive key input
+                            self.permission_prompt = None;
+
+                            self.input_mode = Some(InputMode::ToolSelection {
+                                tools,
+                                selected_idx: 0,
+                                permission_mode: "acceptEdits".to_string(),
+                                worker_id,
+                                request_id,
+                            });
+                        }
+                    }
+                    PermissionDecision::Deny => {
+                        self.submit_permission_decision(decision);
                     }
                 }
-                KeyCode::Char('y') if key_event.modifiers.is_empty() => {
-                    let decision = PermissionDecision::Allow;
-                    self.submit_permission_decision(decision);
-                }
-                KeyCode::Char('n') if key_event.modifiers.is_empty() => {
-                    let decision = PermissionDecision::Deny;
-                    self.submit_permission_decision(decision);
-                }
-                KeyCode::Enter => {
-                    let decision = prompt.selection;
-                    self.submit_permission_decision(decision);
-                }
-                KeyCode::Esc => {
-                    self.submit_permission_decision(PermissionDecision::Deny);
-                }
-                _ => {}
             }
+
             return false;
         }
 
@@ -349,6 +432,82 @@ impl App {
                     }
                     _ => {}
                 },
+                InputMode::ToolSelection {
+                    tools,
+                    selected_idx,
+                    permission_mode,
+                    worker_id,
+                    request_id,
+                } => {
+                    // Will implement key handling here
+                    match key_event.code {
+                        KeyCode::Esc => {
+                            // Cancel - send Deny
+                            if let Err(err) = self.manager.respond_permission(
+                                *worker_id,
+                                *request_id,
+                                PermissionDecision::Deny,
+                            ) {
+                                self.push_log(format!("権限応答の送信に失敗しました: {err}"));
+                            }
+                            self.input_mode = None;
+                        }
+                        KeyCode::Enter => {
+                            // Submit with selected tools and permission_mode
+                            let selected_tools: Vec<String> = tools
+                                .iter()
+                                .filter_map(|(name, &checked)| if checked { Some(name.clone()) } else { None })
+                                .collect();
+
+                            let final_decision = PermissionDecision::Allow {
+                                permission_mode: Some(permission_mode.clone()),
+                                allowed_tools: if selected_tools.is_empty() { None } else { Some(selected_tools) },
+                            };
+
+                            let wid = *worker_id;
+                            let rid = *request_id;
+
+                            // Clear input mode first to release borrow
+                            self.input_mode = None;
+
+                            if let Err(err) = self.manager.respond_permission(wid, rid, final_decision.clone()) {
+                                self.push_log(format!("権限応答の送信に失敗しました: {err}"));
+                            } else {
+                                let worker_name = self.worker_name_by_id(wid).unwrap_or_else(|| format!("worker-{}", wid.0));
+                                self.permission_tracker.insert(
+                                    rid,
+                                    PermissionTrackerEntry {
+                                        worker_name,
+                                        step_name: format!("Tool selection"),
+                                    },
+                                );
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            *selected_idx = selected_idx.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let max_idx = tools.len(); // tools.len() is for permission_mode toggle
+                            *selected_idx = (*selected_idx + 1).min(max_idx);
+                        }
+                        KeyCode::Char(' ') => {
+                            // Toggle tool selection
+                            if *selected_idx < tools.len() {
+                                let tool_name = AVAILABLE_TOOLS[*selected_idx].name;
+                                if let Some(checked) = tools.get_mut(tool_name) {
+                                    *checked = !*checked;
+                                }
+                            } else {
+                                // Toggle permission_mode
+                                *permission_mode = match permission_mode.as_str() {
+                                    "acceptEdits" => "bypassPermissions".to_string(),
+                                    _ => "acceptEdits".to_string(),
+                                };
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             return false;
         }
@@ -435,6 +594,9 @@ impl App {
             }
             KeyCode::Char('I') if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.start_interactive_prompt()
+            }
+            KeyCode::Char('A') if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.toggle_auto_scroll()
             }
             _ => {}
         }
@@ -525,6 +687,8 @@ impl App {
 
     fn scroll_log_up(&mut self) {
         self.log_scroll = self.log_scroll.saturating_sub(1);
+        // Disable auto-scroll when manually scrolling up
+        self.auto_scroll_logs = false;
     }
 
     fn scroll_log_down(&mut self) {
@@ -532,23 +696,38 @@ impl App {
         if self.log_scroll < max_scroll {
             self.log_scroll += 1;
         }
+        // Re-enable auto-scroll if we reached the bottom
+        if self.log_scroll >= max_scroll {
+            self.auto_scroll_logs = true;
+        }
     }
 
     fn scroll_log_home(&mut self) {
         self.log_scroll = 0;
+        // Disable auto-scroll when jumping to top
+        self.auto_scroll_logs = false;
     }
 
     fn scroll_log_end(&mut self) {
         self.log_scroll = self.get_log_max_scroll();
+        // Re-enable auto-scroll when jumping to bottom
+        self.auto_scroll_logs = true;
     }
 
     fn scroll_log_page_up(&mut self) {
         self.log_scroll = self.log_scroll.saturating_sub(10);
+        // Disable auto-scroll when paging up
+        self.auto_scroll_logs = false;
     }
 
     fn scroll_log_page_down(&mut self) {
+        let max_scroll = self.get_log_max_scroll();
         let new_scroll = self.log_scroll.saturating_add(10);
-        self.log_scroll = new_scroll.min(self.get_log_max_scroll());
+        self.log_scroll = new_scroll.min(max_scroll);
+        // Re-enable auto-scroll if we reached the bottom
+        if self.log_scroll >= max_scroll {
+            self.auto_scroll_logs = true;
+        }
     }
 
     fn get_log_max_scroll(&self) -> usize {
@@ -569,6 +748,16 @@ impl App {
             self.log_messages.pop_front();
         }
         self.push_log("アクションログを圧縮しました".into());
+    }
+
+    fn toggle_auto_scroll(&mut self) {
+        self.auto_scroll_logs = !self.auto_scroll_logs;
+        let status = if self.auto_scroll_logs {
+            "ON"
+        } else {
+            "OFF"
+        };
+        self.push_log(format!("ログの自動スクロール: {}", status));
     }
 
     fn switch_log_tab_next(&mut self) {
@@ -732,7 +921,10 @@ impl App {
             if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == worker_id) {
                 // Check if archived
                 if worker.snapshot.status == WorkerStatus::Archived {
-                    self.push_log("アーカイブされたワーカーではインタラクティブモードを使用できません".to_string());
+                    self.push_log(
+                        "アーカイブされたワーカーではインタラクティブモードを使用できません"
+                            .to_string(),
+                    );
                     return;
                 }
 
@@ -749,7 +941,12 @@ impl App {
         }
     }
 
-    fn submit_free_prompt(&mut self, prompt: String, force_new: bool, permission_mode: Option<String>) {
+    fn submit_free_prompt(
+        &mut self,
+        prompt: String,
+        force_new: bool,
+        permission_mode: Option<String>,
+    ) {
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
             self.push_log("空の指示は送信されませんでした".into());
@@ -847,7 +1044,10 @@ impl App {
             worker_id: id,
             worker_name: worker_name.clone(),
             request,
-            selection: PermissionDecision::Allow,
+            selection: PermissionDecision::Allow {
+                permission_mode: None,
+                allowed_tools: None,
+            },
         });
 
         self.permission_tracker.insert(
@@ -899,7 +1099,7 @@ impl App {
         let step_name = tracker.as_ref().map(|entry| entry.step_name.clone());
 
         let action_text = match decision {
-            PermissionDecision::Allow => "許可",
+            PermissionDecision::Allow { .. } => "許可",
             PermissionDecision::Deny => "拒否",
         };
 
@@ -996,6 +1196,10 @@ impl App {
                 }
                 WorkerEvent::Log { id, line } => {
                     self.add_worker_log(id, line);
+                    // Auto-scroll to bottom when new log is added
+                    if self.auto_scroll_logs && self.show_logs {
+                        self.log_scroll = self.get_log_max_scroll();
+                    }
                 }
                 WorkerEvent::Deleted { id, message } => {
                     let worker_name = self
@@ -1082,6 +1286,14 @@ impl App {
                     selected,
                 } => {
                     self.render_worktree_selection_modal(frame, worktrees, *selected);
+                }
+                InputMode::ToolSelection {
+                    tools,
+                    selected_idx,
+                    permission_mode,
+                    ..
+                } => {
+                    self.render_tool_selection_modal(frame, tools, *selected_idx, permission_mode);
                 }
             }
         }
@@ -1427,7 +1639,13 @@ impl App {
         lines.push(Line::raw(""));
 
         let options = [
-            (PermissionDecision::Allow, "許可する"),
+            (
+                PermissionDecision::Allow {
+                    permission_mode: None,
+                    allowed_tools: None,
+                },
+                "許可する",
+            ),
             (PermissionDecision::Deny, "拒否する"),
         ];
 
@@ -1436,7 +1654,7 @@ impl App {
             if idx > 0 {
                 option_spans.push(Span::raw("    "));
             }
-            let is_selected = *decision == prompt.selection;
+            let is_selected = decision == &prompt.selection;
             let style = if is_selected {
                 Style::default()
                     .fg(Color::Black)
@@ -1501,6 +1719,79 @@ impl App {
         frame.render_widget(widget, area);
     }
 
+    fn render_tool_selection_modal(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        tools: &HashMap<String, bool>,
+        selected_idx: usize,
+        permission_mode: &str,
+    ) {
+        let area = centered_rect(70, 60, frame.area());
+
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "ツール選択",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::raw("↑/↓: 移動  Space: 切替  Enter: 決定  Esc: キャンセル"),
+            Line::raw(""),
+        ];
+
+        // Render tool checkboxes
+        for (idx, tool_def) in AVAILABLE_TOOLS.iter().enumerate() {
+            let checked = tools.get(tool_def.name).copied().unwrap_or(false);
+            let checkbox = if checked { "[✓]" } else { "[ ]" };
+            let text = format!("{} {}  - {}", checkbox, tool_def.name, tool_def.description);
+
+            let line = if idx == selected_idx {
+                Line::from(Span::styled(
+                    format!("> {}", text),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(text)
+            };
+            lines.push(line);
+        }
+
+        lines.push(Line::raw(""));
+
+        // Render permission_mode selector
+        let mode_text = format!(
+            "Permission Mode: {}",
+            match permission_mode {
+                "acceptEdits" => "acceptEdits (編集承認)",
+                "bypassPermissions" => "bypassPermissions (制限なし)",
+                _ => permission_mode,
+            }
+        );
+        let mode_line = if selected_idx == AVAILABLE_TOOLS.len() {
+            Line::from(Span::styled(
+                format!("> {} (Space で切替)", mode_text),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(mode_text)
+        };
+        lines.push(mode_line);
+
+        let widget = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Tool Selection"),
+        );
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(widget, area);
+    }
+
     fn render_worktree_selection_modal(
         &self,
         frame: &mut ratatui::Frame<'_>,
@@ -1556,6 +1847,7 @@ impl App {
             Line::raw("h – このヘルプを表示"),
             Line::raw("Shift+C – アクションログを圧縮"),
             Line::raw("Shift+I – インタラクティブClaude Code起動（権限を手動承認可能）"),
+            Line::raw("Shift+A – ログの自動スクロールON/OFF切替"),
             Line::raw("q – 終了"),
             Line::raw(""),
             Line::raw("ステータス: Running/Idle/Paused/Failed/Archived(青=履歴)"),
@@ -1592,15 +1884,22 @@ impl App {
             .map(|s| Line::from(s.clone()))
             .collect();
 
+        let auto_scroll_status = if self.auto_scroll_logs {
+            "[Auto-scroll: ON]"
+        } else {
+            "[Auto-scroll: OFF]"
+        };
+
         let title = if total_lines > 1 {
             format!(
-                "{} (line {}/{}) [↑↓:scroll PgUp/PgDn:page Home/End:jump]",
+                "{} (line {}/{}) {} [↑↓:scroll PgUp/PgDn:page Home/End:jump Shift+A:toggle]",
                 base_title,
                 visible_start + 1,
-                total_lines
+                total_lines,
+                auto_scroll_status
             )
         } else {
-            base_title.to_string()
+            format!("{} {}", base_title, auto_scroll_status)
         };
 
         (title, visible_lines)
@@ -1625,7 +1924,12 @@ impl App {
 
             if entries.is_empty() {
                 let lines = vec![Line::raw("このワーカーにはまだステップログがありません。")];
-                let title = "Overview [Tab:switch tabs]";
+                let auto_scroll_status = if self.auto_scroll_logs {
+                    "[Auto-scroll: ON]"
+                } else {
+                    "[Auto-scroll: OFF]"
+                };
+                let title = format!("Overview {} [Tab:switch tabs Shift+A:toggle]", auto_scroll_status);
                 let widget = Paragraph::new(lines)
                     .block(Block::default().borders(Borders::ALL).title(title));
                 frame.render_widget(Clear, area);
@@ -1701,10 +2005,20 @@ impl App {
                 Constraint::Min(30),
             ];
 
+            let auto_scroll_status = if self.auto_scroll_logs {
+                "[Auto-scroll: ON]"
+            } else {
+                "[Auto-scroll: OFF]"
+            };
+            let title = format!(
+                "Overview {} [Tab:switch tabs | Enter:detail | j/k:select | Shift+A:toggle]",
+                auto_scroll_status
+            );
+
             let table = Table::new(rows, widths).header(header).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Overview [Tab:switch tabs | Enter:detail | j/k:select]"),
+                    .title(title),
             );
 
             frame.render_widget(Clear, area);
@@ -1766,9 +2080,15 @@ impl App {
                 let visible_lines: Vec<Line> =
                     lines.iter().skip(self.log_scroll).cloned().collect();
 
+                let auto_scroll_status = if self.auto_scroll_logs {
+                    "[Auto-scroll: ON]"
+                } else {
+                    "[Auto-scroll: OFF]"
+                };
                 let title = format!(
-                    "Detail - Step {} [Tab:switch tabs | Esc:back | ↑↓:scroll]",
-                    entry.step_index
+                    "Detail - Step {} {} [Tab:switch tabs | Esc:back | ↑↓:scroll | Shift+A:toggle]",
+                    entry.step_index,
+                    auto_scroll_status
                 );
 
                 let widget = Paragraph::new(visible_lines)
@@ -1992,12 +2312,27 @@ impl WorkerView {
                     }
                 }
             }
+        } else if line == "─── Prompt ───" {
+            // Start of prompt section (alternative to [PROMPT_START])
+            self.in_prompt = true;
+            self.in_result = false;
+            self.in_thought = false;
         } else if line == "[PROMPT_START]" {
             self.in_prompt = true;
             self.in_result = false;
             self.in_thought = false;
         } else if line == "[PROMPT_END]" {
             self.in_prompt = false;
+        } else if line == "─── Result ───" {
+            // Start of result section (alternative to [RESULT_START])
+            self.in_prompt = false;
+            self.in_result = true;
+            self.in_thought = false;
+        } else if line.starts_with("───") && line.ends_with("───") {
+            // Other section markers (Claude Code コマンド, stderr, etc.) end current sections
+            self.in_prompt = false;
+            self.in_result = false;
+            self.in_thought = false;
         } else if line == "[RESULT_START]" {
             self.in_prompt = false;
             self.in_result = true;
@@ -2069,6 +2404,13 @@ enum InputMode {
         worktrees: Vec<ExistingWorktree>,
         selected: usize,
     },
+    ToolSelection {
+        tools: HashMap<String, bool>,  // tool name -> checked state
+        selected_idx: usize,            // cursor position (0..tools.len() + 1, last item is permission_mode)
+        permission_mode: String,        // "acceptEdits" or "bypassPermissions"
+        worker_id: WorkerId,            // worker requesting permission
+        request_id: u64,                // permission request ID
+    },
 }
 
 struct PermissionPromptState {
@@ -2080,9 +2422,12 @@ struct PermissionPromptState {
 
 impl PermissionPromptState {
     fn toggle(&mut self) {
-        self.selection = match self.selection {
-            PermissionDecision::Allow => PermissionDecision::Deny,
-            PermissionDecision::Deny => PermissionDecision::Allow,
+        self.selection = match &self.selection {
+            PermissionDecision::Allow { .. } => PermissionDecision::Deny,
+            PermissionDecision::Deny => PermissionDecision::Allow {
+                permission_mode: None,
+                allowed_tools: None,
+            },
         };
     }
 }
@@ -2137,9 +2482,10 @@ fn status_color(status: WorkerStatus) -> Color {
 
 fn permission_mode_label(permission_mode: &Option<String>) -> &str {
     match permission_mode.as_deref() {
-        None => "通常モード",
+        None => "制限なしモード",
         Some("plan") => "プランモード",
         Some("acceptEdits") => "編集承認モード",
+        Some("bypassPermissions") => "制限なしモード",
         Some(other) => other,
     }
 }

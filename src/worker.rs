@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -127,9 +128,12 @@ pub enum WorkerEvent {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PermissionDecision {
-    Allow,
+    Allow {
+        permission_mode: Option<String>,
+        allowed_tools: Option<Vec<String>>,
+    },
     Deny,
 }
 
@@ -367,6 +371,9 @@ impl WorkerManager {
     }
 
     fn run(mut self) {
+        // Give UI time to start polling events before restoring workers
+        thread::sleep(Duration::from_millis(100));
+
         // Restore workers before entering command loop
         self.restore_workers();
 
@@ -767,7 +774,7 @@ impl WorkerManager {
         decision: PermissionDecision,
     ) {
         if let Some(pending) = self.pending_permissions.remove(&request_id) {
-            let _ = pending.respond_to.send(decision);
+            let _ = pending.respond_to.send(decision.clone());
             let _ = self.evt_tx.send(WorkerEvent::PermissionResolved {
                 id,
                 request_id,
@@ -1103,9 +1110,13 @@ fn agent_simulation(
                 worker_id,
             );
 
-            match perm_rx.recv() {
-                Ok(PermissionDecision::Allow) => {
+            let (effective_permission_mode, effective_allowed_tools) = match perm_rx.recv() {
+                Ok(PermissionDecision::Allow {
+                    permission_mode,
+                    allowed_tools,
+                }) => {
                     send_log("権限が承認されました".to_string(), worker_id);
+                    (permission_mode, allowed_tools)
                 }
                 Ok(PermissionDecision::Deny) => {
                     send_log(
@@ -1121,7 +1132,7 @@ fn agent_simulation(
                     }
                     return;
                 }
-                Err(_) => {
+                Err(_err) => {
                     send_log(
                         "権限確認中に内部エラーが発生したため中断します".to_string(),
                         worker_id,
@@ -1134,7 +1145,7 @@ fn agent_simulation(
                     }
                     return;
                 }
-            }
+            };
 
             let prompt = render_prompt(&claude_cfg.prompt, &snapshot_info);
 
@@ -1150,25 +1161,32 @@ fn agent_simulation(
             send_log("─── Claude Code コマンド ───".to_string(), worker_id);
 
             // Permission Mode
-            let permission_mode_str = if let Some(mode) = &claude_cfg.permission_mode {
-                match mode.as_str() {
-                    "plan" => "プランモード (plan)".to_string(),
-                    other => format!("{}", other),
-                }
-            } else {
-                "通常モード".to_string()
+            let effective_mode = claude_cfg
+                .permission_mode
+                .as_deref()
+                .unwrap_or("bypassPermissions");
+            let permission_mode_str = match effective_mode {
+                "plan" => "プランモード (plan)".to_string(),
+                "acceptEdits" => "編集承認モード (acceptEdits)".to_string(),
+                "bypassPermissions" => "制限なしモード (bypassPermissions)".to_string(),
+                other => format!("{}", other),
             };
             send_log(
                 format!("Permission Mode: {}", permission_mode_str),
                 worker_id,
             );
 
+            // Override claude_cfg with user-selected permissions
+            let mut claude_cfg_with_permissions = claude_cfg.clone();
+            claude_cfg_with_permissions.permission_mode = effective_permission_mode.or_else(|| claude_cfg.permission_mode.clone());
+            claude_cfg_with_permissions.allowed_tools = effective_allowed_tools.or_else(|| claude_cfg.allowed_tools.clone());
+
             // Model
-            let model_str = claude_cfg.model.as_deref().unwrap_or("デフォルト");
+            let model_str = claude_cfg_with_permissions.model.as_deref().unwrap_or("デフォルト");
             send_log(format!("Model: {}", model_str), worker_id);
 
             // Allowed Tools
-            let tools_str = if let Some(tools) = &claude_cfg.allowed_tools {
+            let tools_str = if let Some(tools) = &claude_cfg_with_permissions.allowed_tools {
                 if tools.is_empty() {
                     "なし".to_string()
                 } else {
@@ -1189,25 +1207,30 @@ fn agent_simulation(
             send_log(format!("Session: {}", session_str), worker_id);
 
             // Extra Args
-            if let Some(extra) = &claude_cfg.extra_args {
+            if let Some(extra) = &claude_cfg_with_permissions.extra_args {
                 if !extra.is_empty() {
                     send_log(format!("Extra Args: {}", extra.join(" ")), worker_id);
                 }
             }
 
             // Pass current session_id to continue the session
-            run_claude_command(claude_cfg, &prompt, &worktree_path, current_session_id).map(
-                |(lines, new_session_id)| {
-                    // Store the session_id back into the snapshot
-                    if let Some(sid) = new_session_id {
-                        if let Ok(mut snapshot) = state.lock() {
-                            snapshot.session_id = Some(sid);
-                            let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
-                        }
-                    }
-                    lines
-                },
-            )
+            let result = run_claude_command(
+                &claude_cfg_with_permissions,
+                &prompt,
+                &worktree_path,
+                current_session_id,
+                |line| send_log(line, worker_id),
+            );
+
+            // Store the session_id back into the snapshot
+            if let Ok(Some(new_session_id)) = &result {
+                if let Ok(mut snapshot) = state.lock() {
+                    snapshot.session_id = Some(new_session_id.clone());
+                    let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+                }
+            }
+
+            result.map(|_| vec![])
         } else if let Some(command) = &step.command {
             send_log(format!("$ {}", command), worker_id);
             run_shell_command(command, &worktree_path)
@@ -1306,12 +1329,16 @@ fn run_shell_command(command: &str, dir: &Path) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-fn run_claude_command(
+fn run_claude_command<F>(
     step: &ClaudeStep,
     prompt: &str,
     dir: &Path,
     session_id: Option<&str>,
-) -> Result<(Vec<String>, Option<String>)> {
+    mut log_fn: F,
+) -> Result<Option<String>>
+where
+    F: FnMut(String),
+{
     let binary = env::var("GENSUI_CLAUDE_BIN").unwrap_or_else(|_| {
         // Try to find claude in common locations
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -1323,6 +1350,20 @@ fn run_claude_command(
         }
     });
     let mut cmd = Command::new(&binary);
+
+    // Only set custom CLAUDE_CONFIG_DIR if GENSUI_CLAUDE_HOME is explicitly set
+    // Otherwise, use the user's default Claude configuration (including API keys)
+    if let Ok(custom_home) = env::var("GENSUI_CLAUDE_HOME") {
+        let claude_home = PathBuf::from(custom_home);
+        fs::create_dir_all(&claude_home).with_context(|| {
+            format!(
+                "failed to prepare Claude config directory at {}",
+                claude_home.display()
+            )
+        })?;
+        cmd.env("CLAUDE_CONFIG_DIR", &claude_home);
+    }
+    // Otherwise, don't set HOME or CLAUDE_CONFIG_DIR - use user's default settings
 
     cmd.arg("--print").arg(prompt);
     cmd.arg("--output-format").arg("stream-json");
@@ -1337,9 +1378,13 @@ fn run_claude_command(
         cmd.arg("--model").arg(model);
     }
 
-    if let Some(mode) = &step.permission_mode {
-        cmd.arg("--permission-mode").arg(mode);
-    }
+    // If permission_mode is not set, use bypassPermissions by default
+    // This allows Claude to execute tools freely after user approves the step
+    let effective_mode = step
+        .permission_mode
+        .as_deref()
+        .unwrap_or("bypassPermissions");
+    cmd.arg("--permission-mode").arg(effective_mode);
 
     if let Some(tools) = &step.allowed_tools {
         if !tools.is_empty() {
@@ -1358,114 +1403,144 @@ fn run_claude_command(
 
     cmd.current_dir(dir);
 
-    let output = cmd
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .with_context(|| "failed to execute Claude Code process")?;
+        .spawn()
+        .with_context(|| "failed to spawn Claude Code process")?;
 
-    let mut lines = Vec::new();
     let mut extracted_session_id: Option<String> = None;
+    let mut stderr_lines = Vec::new();
 
-    // Process stdout - parse JSON stream
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    for line in stdout_str.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
+    // Capture stderr in a separate thread
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut lines = Vec::new();
+            for line in reader.lines().flatten() {
+                lines.push(line);
+            }
+            lines
+        })
+    });
 
-        // Try to parse as JSON
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-            let thought_lines = extract_thinking_lines(&json);
-            if !thought_lines.is_empty() {
-                lines.push("[THOUGHT_START]".to_string());
-                lines.extend(thought_lines);
-                lines.push("[THOUGHT_END]".to_string());
+    // Stream stdout in real-time
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    log_fn(format!("Error reading stdout: {}", e));
+                    continue;
+                }
+            };
+
+            if line.trim().is_empty() {
+                continue;
             }
 
-            match json.get("type").and_then(|v| v.as_str()) {
-                Some("system") => {
-                    // Session initialization - extract session_id but don't log
-                    if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
-                        extracted_session_id = Some(sid.to_string());
+            // Try to parse as JSON
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                // Extract thinking/analysis
+                let thought_lines = extract_thinking_lines(&json);
+                if !thought_lines.is_empty() {
+                    log_fn("[THOUGHT_START]".to_string());
+                    for thought_line in thought_lines {
+                        log_fn(thought_line);
                     }
+                    log_fn("[THOUGHT_END]".to_string());
                 }
-                Some("result") => {
-                    // Check for errors first
-                    if let Some(true) = json.get("is_error").and_then(|v| v.as_bool()) {
-                        lines.push("⚠️  Claude encountered an error".to_string());
-                    }
 
-                    // Final result
-                    if let Some(result_text) = json.get("result").and_then(|v| v.as_str()) {
-                        if !result_text.is_empty() {
-                            lines.push("─── Result ───".to_string());
-                            for result_line in result_text.lines() {
-                                lines.push(result_line.to_string());
+                match json.get("type").and_then(|v| v.as_str()) {
+                    Some("system") => {
+                        // Session initialization - extract session_id but don't log
+                        if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                            extracted_session_id = Some(sid.to_string());
+                        }
+                    }
+                    Some("result") => {
+                        // Check for errors first
+                        if let Some(true) = json.get("is_error").and_then(|v| v.as_bool()) {
+                            log_fn("⚠️  Claude encountered an error".to_string());
+                        }
+
+                        // Final result
+                        if let Some(result_text) = json.get("result").and_then(|v| v.as_str()) {
+                            if !result_text.is_empty() {
+                                log_fn("─── Result ───".to_string());
+                                for result_line in result_text.lines() {
+                                    log_fn(result_line.to_string());
+                                }
                             }
                         }
                     }
-                }
-                Some("error") => {
-                    // API error response
-                    lines.push("❌ API Error:".to_string());
-                    if let Some(error_obj) = json.get("error") {
-                        if let Some(message) = error_obj.get("message").and_then(|v| v.as_str()) {
-                            lines.push(format!("  {}", message));
+                    Some("error") => {
+                        // API error response
+                        log_fn("❌ API Error:".to_string());
+                        if let Some(error_obj) = json.get("error") {
+                            if let Some(message) = error_obj.get("message").and_then(|v| v.as_str()) {
+                                log_fn(format!("  {}", message));
+                            }
                         }
                     }
+                    Some("assistant") => {
+                        // Log assistant messages
+                        if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                            if !text.trim().is_empty() {
+                                log_fn(format!("💬 {}", text));
+                            }
+                        }
+                    }
+                    Some("tool_use") => {
+                        // Log tool usage
+                        if let Some(tool_name) = json.get("name").and_then(|v| v.as_str()) {
+                            log_fn(format!("🔧 Using tool: {}", tool_name));
+                        }
+                    }
+                    _ => {
+                        // Log raw JSON for other event types for debugging
+                        log_fn(format!("🔍 JSON: {}", line));
+                    }
                 }
-                _ => {
-                    // Ignore other event types (assistant, tool_use, etc.)
-                }
+            } else {
+                // Non-JSON output
+                log_fn(line);
             }
         }
     }
 
-    // Process stderr
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    for line in stderr_str.lines() {
-        if !line.trim().is_empty() {
-            lines.push(format!("stderr: {}", line));
+    // Wait for process to complete
+    let status = child.wait().with_context(|| "failed to wait for Claude Code process")?;
+
+    // Collect stderr from thread
+    if let Some(handle) = stderr_handle {
+        if let Ok(lines) = handle.join() {
+            stderr_lines = lines;
         }
     }
 
-    if !output.status.success() {
-        let stderr_lines: Vec<_> = lines
-            .iter()
-            .filter(|l| l.starts_with("stderr:"))
-            .cloned()
-            .collect();
-        let other_lines: Vec<_> = lines
-            .iter()
-            .filter(|l| !l.starts_with("stderr:"))
-            .cloned()
-            .collect();
-
-        let mut error_parts = vec![format!("Claude CLI exited with status {}", output.status)];
-
-        let has_other = !other_lines.is_empty();
-        let has_stderr = !stderr_lines.is_empty();
-
-        if has_other {
-            error_parts.push("Output:".to_string());
-            error_parts.extend(other_lines);
+    // Log stderr output
+    if !stderr_lines.is_empty() {
+        log_fn("─── stderr ───".to_string());
+        for line in &stderr_lines {
+            if !line.trim().is_empty() {
+                log_fn(line.clone());
+            }
         }
-
-        if has_stderr {
-            error_parts.push("Errors:".to_string());
-            error_parts.extend(stderr_lines);
-        }
-
-        if !has_other && !has_stderr {
-            error_parts.push("No output captured".to_string());
-        }
-
-        return Err(anyhow!("{}", error_parts.join("\n")));
     }
 
-    Ok((lines, extracted_session_id))
+    if !status.success() {
+        let mut error_msg = format!("Claude CLI exited with status {}", status);
+        if !stderr_lines.is_empty() {
+            error_msg.push_str("\nstderr:\n");
+            error_msg.push_str(&stderr_lines.join("\n"));
+        }
+        return Err(anyhow!("{}", error_msg));
+    }
+
+    Ok(extracted_session_id)
 }
 
 fn extract_thinking_lines(json: &serde_json::Value) -> Vec<String> {
