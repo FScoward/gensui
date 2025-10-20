@@ -1,4 +1,5 @@
 mod config;
+mod log_parser;
 mod state;
 mod ui;
 mod worker;
@@ -25,7 +26,7 @@ use crate::ui::{
     render_footer, render_header, render_log_modal, render_modal,
     render_overview_tab, render_permission_modal, render_prompt_modal,
     render_table, render_tool_selection_modal, render_worktree_selection_modal,
-    LogEntry, LogViewMode, StepStatus, AVAILABLE_TOOLS,
+    LogEntry, LogViewMode, AVAILABLE_TOOLS,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use worker::{
@@ -1526,15 +1527,8 @@ struct WorkerView {
     snapshot: WorkerSnapshot,
     logs: VecDeque<String>,
     structured_logs: Vec<LogEntry>,
-    // Parser state
-    current_step_index: Option<usize>,
-    current_step_name: Option<String>,
-    current_prompt: Vec<String>,
-    current_result: Vec<String>,
-    current_thought: Vec<String>,
-    in_prompt: bool,
-    in_result: bool,
-    in_thought: bool,
+    // Parser
+    log_parser: log_parser::LogParser,
 }
 
 
@@ -1546,14 +1540,7 @@ impl WorkerView {
             snapshot,
             logs: VecDeque::with_capacity(Self::LOG_CAPACITY),
             structured_logs: Vec::new(),
-            current_step_index: None,
-            current_step_name: None,
-            current_prompt: Vec::new(),
-            current_result: Vec::new(),
-            current_thought: Vec::new(),
-            in_prompt: false,
-            in_result: false,
-            in_thought: false,
+            log_parser: log_parser::LogParser::new(),
         }
     }
 
@@ -1567,106 +1554,9 @@ impl WorkerView {
         }
         self.logs.push_back(line.clone());
 
-        // Parse structured log markers
-        self.parse_log_line(&line);
-    }
-
-    fn parse_log_line(&mut self, line: &str) {
-        if line.starts_with("[STEP_START:") {
-            // Extract step index and name
-            if let Some(content) = line
-                .strip_prefix("[STEP_START:")
-                .and_then(|s| s.strip_suffix("]"))
-            {
-                let parts: Vec<&str> = content.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    if let Ok(idx) = parts[0].parse::<usize>() {
-                        self.current_step_index = Some(idx);
-                        self.current_step_name = Some(parts[1].to_string());
-                        self.current_prompt.clear();
-                        self.current_result.clear();
-                        self.current_thought.clear();
-                        self.in_prompt = false;
-                        self.in_result = false;
-                        self.in_thought = false;
-                    }
-                }
-            }
-        } else if line == "─── Prompt ───" {
-            // Start of prompt section (alternative to [PROMPT_START])
-            self.in_prompt = true;
-            self.in_result = false;
-            self.in_thought = false;
-        } else if line == "[PROMPT_START]" {
-            self.in_prompt = true;
-            self.in_result = false;
-            self.in_thought = false;
-        } else if line == "[PROMPT_END]" {
-            self.in_prompt = false;
-        } else if line == "─── Result ───" {
-            // Start of result section (alternative to [RESULT_START])
-            self.in_prompt = false;
-            self.in_result = true;
-            self.in_thought = false;
-        } else if line.starts_with("───") && line.ends_with("───") {
-            // Other section markers (Claude Code コマンド, stderr, etc.) end current sections
-            self.in_prompt = false;
-            self.in_result = false;
-            self.in_thought = false;
-        } else if line == "[RESULT_START]" {
-            self.in_prompt = false;
-            self.in_result = true;
-            self.in_thought = false;
-        } else if line == "[RESULT_END]" {
-            self.in_result = false;
-        } else if line == "[THOUGHT_START]" {
-            self.in_prompt = false;
-            self.in_result = false;
-            self.in_thought = true;
-            self.current_thought.clear();
-        } else if line == "[THOUGHT_END]" {
-            self.in_thought = false;
-        } else if line.starts_with("[STEP_END:") {
-            // Finalize current step
-            if let Some(content) = line
-                .strip_prefix("[STEP_END:")
-                .and_then(|s| s.strip_suffix("]"))
-            {
-                let status = match content {
-                    "Success" => StepStatus::Success,
-                    "Failed" => StepStatus::Failed,
-                    _ => StepStatus::Running,
-                };
-
-                if let (Some(idx), Some(name)) = (self.current_step_index, &self.current_step_name)
-                {
-                    let entry = LogEntry {
-                        step_index: idx,
-                        step_name: name.clone(),
-                        prompt_lines: self.current_prompt.clone(),
-                        result_lines: self.current_result.clone(),
-                        thought_lines: self.current_thought.clone(),
-                        status,
-                    };
-                    self.structured_logs.push(entry);
-
-                    // Reset state
-                    self.current_step_index = None;
-                    self.current_step_name = None;
-                    self.current_prompt.clear();
-                    self.current_result.clear();
-                    self.current_thought.clear();
-                    self.in_thought = false;
-                }
-            }
-        } else if self.in_prompt && !line.starts_with("─") {
-            // Collect prompt lines (skip separator lines)
-            self.current_prompt.push(line.to_string());
-        } else if self.in_result && !line.starts_with("─") {
-            // Collect result lines (skip separator lines)
-            self.current_result.push(line.to_string());
-        } else if self.in_thought {
-            self.current_thought.push(line.to_string());
+        // Parse structured log markers using log_parser
+        if let Some(entry) = self.log_parser.parse_line(&line) {
+            self.structured_logs.push(entry);
         }
     }
 }

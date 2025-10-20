@@ -18,4 +18,4 @@ pub use modals::{
     render_worktree_selection_modal,
 };
 pub use render::{help_lines, render_footer, render_header, render_table};
-pub use types::{LogEntry, LogViewMode, StepStatus, AVAILABLE_TOOLS};
+pub use types::{LogEntry, LogViewMode, AVAILABLE_TOOLS};
