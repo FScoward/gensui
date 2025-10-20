@@ -1213,6 +1213,19 @@ fn agent_simulation(
                 }
             }
 
+            // Update status to show execution in progress
+            if let Ok(mut snapshot) = state.lock() {
+                snapshot.last_event = "Claude Codeを実行中... ⏳".into();
+                let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+            }
+
+            send_log("".to_string(), worker_id);
+            send_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string(), worker_id);
+            send_log("⏳ Claude Code実行中...".to_string(), worker_id);
+            send_log("   出力は実行完了後に表示されます".to_string(), worker_id);
+            send_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string(), worker_id);
+            send_log("".to_string(), worker_id);
+
             // Pass current session_id to continue the session
             let result = run_claude_command(
                 &claude_cfg_with_permissions,
@@ -1221,6 +1234,12 @@ fn agent_simulation(
                 current_session_id,
                 |line| send_log(line, worker_id),
             );
+
+            send_log("".to_string(), worker_id);
+            send_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string(), worker_id);
+            send_log("✅ Claude Code実行完了".to_string(), worker_id);
+            send_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string(), worker_id);
+            send_log("".to_string(), worker_id);
 
             // Store the session_id back into the snapshot
             if let Ok(Some(new_session_id)) = &result {
@@ -1425,9 +1444,9 @@ where
         })
     });
 
-    // Stream stdout in real-time
+    // Stream stdout in real-time with small buffer for responsiveness
     if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
+        let reader = BufReader::with_capacity(256, stdout);
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
