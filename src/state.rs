@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Workflow;
@@ -128,6 +128,28 @@ impl StateStore {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove worker state {}", path.display()))?;
         }
+        Ok(())
+    }
+
+    pub fn rename_worker(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let old_path = self.worker_path(old_name);
+        let new_path = self.worker_path(new_name);
+
+        if !old_path.exists() {
+            return Err(anyhow!("Worker state file {} not found", old_path.display()));
+        }
+
+        if new_path.exists() {
+            return Err(anyhow!("Worker state file {} already exists", new_path.display()));
+        }
+
+        fs::rename(&old_path, &new_path)
+            .with_context(|| format!(
+                "Failed to rename worker state from {} to {}",
+                old_path.display(),
+                new_path.display()
+            ))?;
+
         Ok(())
     }
 

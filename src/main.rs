@@ -24,8 +24,9 @@ use crate::ui::{
     centered_rect, describe_allowed_tools, format_action_log, help_lines, permission_mode_label,
     prepare_raw_log_data, render_create_selection_modal, render_detail_tab,
     render_footer, render_header, render_log_modal, render_modal,
-    render_overview_tab, render_permission_modal, render_prompt_modal,
-    render_table, render_tool_selection_modal, render_worktree_selection_modal,
+    render_name_input_modal, render_overview_tab, render_permission_modal,
+    render_prompt_modal, render_rename_worker_modal, render_table,
+    render_tool_selection_modal, render_worktree_selection_modal,
     LogEntry, LogViewMode, AVAILABLE_TOOLS,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -306,6 +307,7 @@ impl App {
                     buffer,
                     force_new,
                     permission_mode,
+                    worker_name,
                 } => match key_event.code {
                     KeyCode::Esc => {
                         self.input_mode = None;
@@ -314,9 +316,10 @@ impl App {
                         let prompt = buffer.trim().to_string();
                         let is_force_new = *force_new;
                         let mode = permission_mode.clone();
+                        let name = worker_name.clone();
                         self.input_mode = None;
                         if !prompt.is_empty() {
-                            self.submit_free_prompt(prompt, is_force_new, mode);
+                            self.submit_free_prompt(prompt, is_force_new, mode, name);
                         } else {
                             self.push_log("空の指示は送信されませんでした".into());
                         }
@@ -353,15 +356,11 @@ impl App {
                         let choice = *selected;
                         self.input_mode = None;
                         if choice == 0 {
-                            // Run workflow
+                            // Run workflow - show name input first
                             self.enqueue_create_worker();
                         } else if choice == 1 {
-                            // Free input - always create new worker
-                            self.input_mode = Some(InputMode::FreePrompt {
-                                buffer: String::new(),
-                                force_new: true,
-                                permission_mode: None,
-                            });
+                            // Free input - show name input first, then free prompt
+                            self.show_name_input_for_free_prompt();
                         } else {
                             // Use existing worktree
                             self.show_worktree_selection();
@@ -475,6 +474,94 @@ impl App {
                         _ => {}
                     }
                 }
+                InputMode::NameInput { buffer, workflow_name, next_action } => match key_event.code {
+                    KeyCode::Esc => {
+                        // Cancel and use default name
+                        let workflow = workflow_name.clone();
+                        let action = next_action.clone();
+                        self.input_mode = None;
+
+                        match action {
+                            NameInputNextAction::CreateWithWorkflow => {
+                                self.create_worker_with_default_name(workflow);
+                            }
+                            NameInputNextAction::CreateWithFreePrompt => {
+                                // Show free prompt modal with default name
+                                self.input_mode = Some(InputMode::FreePrompt {
+                                    buffer: String::new(),
+                                    force_new: true,
+                                    permission_mode: None,
+                                    worker_name: None,
+                                });
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let name = buffer.trim().to_string();
+                        let workflow = workflow_name.clone();
+                        let action = next_action.clone();
+                        self.input_mode = None;
+
+                        match action {
+                            NameInputNextAction::CreateWithWorkflow => {
+                                if name.is_empty() {
+                                    // Use default name
+                                    self.create_worker_with_default_name(workflow);
+                                } else {
+                                    // Use user-provided name
+                                    self.create_worker_with_name(name, workflow);
+                                }
+                            }
+                            NameInputNextAction::CreateWithFreePrompt => {
+                                // Show free prompt modal
+                                let worker_name = if name.is_empty() { None } else { Some(name) };
+                                self.input_mode = Some(InputMode::FreePrompt {
+                                    buffer: String::new(),
+                                    force_new: true,
+                                    permission_mode: None,
+                                    worker_name,
+                                });
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key_event.modifiers.contains(KeyModifiers::ALT)
+                        {
+                            buffer.push(c);
+                        }
+                    }
+                    _ => {}
+                },
+                InputMode::RenameWorker { buffer, worker_id } => match key_event.code {
+                    KeyCode::Esc => {
+                        self.input_mode = None;
+                    }
+                    KeyCode::Enter => {
+                        let new_name = buffer.trim().to_string();
+                        let wid = *worker_id;
+                        self.input_mode = None;
+                        if !new_name.is_empty() {
+                            self.rename_worker(wid, new_name);
+                        } else {
+                            self.push_log("空の名前は無効です".into());
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key_event.modifiers.contains(KeyModifiers::ALT)
+                        {
+                            buffer.push(c);
+                        }
+                    }
+                    _ => {}
+                },
             }
             return false;
         }
@@ -484,6 +571,7 @@ impl App {
             KeyCode::Char('c') => self.show_create_selection(),
             KeyCode::Char('d') => self.enqueue_delete_worker(),
             KeyCode::Char('r') => self.enqueue_restart_worker(),
+            KeyCode::Char('n') => self.show_rename_modal(),
             KeyCode::Char('i') => self.start_free_prompt(),
             KeyCode::Char('h') => self.toggle_help(),
             KeyCode::Char('l') => self.toggle_logs(),
@@ -572,14 +660,67 @@ impl App {
     }
 
     fn enqueue_create_worker(&mut self) {
-        let mut request = CreateWorkerRequest::default();
-        request.workflow = self
+        // Show name input modal
+        let workflow_name = self
             .workflows
             .get(self.selected_workflow_idx)
             .map(|wf| wf.name.clone());
 
+        self.input_mode = Some(InputMode::NameInput {
+            buffer: String::new(),
+            workflow_name,
+            next_action: NameInputNextAction::CreateWithWorkflow,
+        });
+    }
+
+    fn show_name_input_for_free_prompt(&mut self) {
+        self.input_mode = Some(InputMode::NameInput {
+            buffer: String::new(),
+            workflow_name: None,
+            next_action: NameInputNextAction::CreateWithFreePrompt,
+        });
+    }
+
+    fn create_worker_with_default_name(&mut self, workflow_name: Option<String>) {
+        let mut request = CreateWorkerRequest::default();
+        request.workflow = workflow_name;
+        request.name = None; // Use default name
+
         if let Err(err) = self.manager.create_worker(request) {
             self.push_log(format!("ワーカー作成に失敗しました: {err}"));
+        } else {
+            self.push_log("ワーカーを作成しました（デフォルト名）".into());
+        }
+    }
+
+    fn create_worker_with_name(&mut self, name: String, workflow_name: Option<String>) {
+        let mut request = CreateWorkerRequest::default();
+        request.workflow = workflow_name;
+        request.name = Some(name.clone());
+
+        if let Err(err) = self.manager.create_worker(request) {
+            self.push_log(format!("ワーカー作成に失敗しました: {err}"));
+        } else {
+            self.push_log(format!("ワーカーを作成しました: {}", name));
+        }
+    }
+
+    fn show_rename_modal(&mut self) {
+        if let Some(id) = self.selected_worker_id() {
+            self.input_mode = Some(InputMode::RenameWorker {
+                buffer: String::new(),
+                worker_id: id,
+            });
+        } else {
+            self.push_log("ワーカーが選択されていません".into());
+        }
+    }
+
+    fn rename_worker(&mut self, worker_id: WorkerId, new_name: String) {
+        if let Err(err) = self.manager.rename_worker(worker_id, new_name.clone()) {
+            self.push_log(format!("ワーカー名の変更に失敗しました: {err}"));
+        } else {
+            self.push_log(format!("ワーカー名を変更しました: {}", new_name));
         }
     }
 
@@ -879,6 +1020,7 @@ impl App {
             buffer: String::new(),
             force_new: false,
             permission_mode: None,
+            worker_name: None,
         });
     }
 
@@ -913,6 +1055,7 @@ impl App {
         prompt: String,
         force_new: bool,
         permission_mode: Option<String>,
+        worker_name: Option<String>,
     ) {
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
@@ -961,6 +1104,7 @@ impl App {
         let mut request = CreateWorkerRequest::default();
         request.free_prompt = Some(trimmed.to_string());
         request.permission_mode = permission_mode.clone();
+        request.name = worker_name;
 
         match self.manager.create_worker(request) {
             Ok(_) => {
@@ -1174,6 +1318,12 @@ impl App {
                         self.push_log(message);
                     }
                 }
+                WorkerEvent::Renamed { id: _, old_name, new_name } => {
+                    self.push_log_with_worker(
+                        Some(&new_name),
+                        format!("Worker renamed: '{}' → '{}'", old_name, new_name),
+                    );
+                }
                 WorkerEvent::Error { id, message } => {
                     if let Some(worker_id) = id {
                         self.add_worker_log(worker_id, format!("エラー: {message}"));
@@ -1254,6 +1404,14 @@ impl App {
                     ..
                 } => {
                     self.render_tool_selection_modal(frame, tools, *selected_idx, permission_mode);
+                }
+                InputMode::NameInput { buffer, workflow_name, .. } => {
+                    self.render_name_input_modal(frame, buffer, workflow_name);
+                }
+                InputMode::RenameWorker { buffer, worker_id } => {
+                    if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == *worker_id) {
+                        self.render_rename_worker_modal(frame, buffer, &worker.snapshot.name);
+                    }
                 }
             }
         }
@@ -1357,6 +1515,26 @@ impl App {
     ) {
         let area = centered_rect(70, 50, frame.area());
         render_worktree_selection_modal(frame, area, worktrees, selected);
+    }
+
+    fn render_name_input_modal(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        buffer: &str,
+        workflow_name: &Option<String>,
+    ) {
+        let area = centered_rect(60, 40, frame.area());
+        render_name_input_modal(frame, area, buffer, workflow_name);
+    }
+
+    fn render_rename_worker_modal(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        buffer: &str,
+        current_name: &str,
+    ) {
+        let area = centered_rect(60, 40, frame.area());
+        render_rename_worker_modal(frame, area, buffer, current_name);
     }
 
     fn help_lines(&self) -> Vec<Line<'static>> {
@@ -1566,6 +1744,7 @@ enum InputMode {
         buffer: String,
         force_new: bool,
         permission_mode: Option<String>,
+        worker_name: Option<String>,
     },
     CreateWorkerSelection {
         selected: usize,
@@ -1581,6 +1760,21 @@ enum InputMode {
         worker_id: WorkerId,            // worker requesting permission
         request_id: u64,                // permission request ID
     },
+    NameInput {
+        buffer: String,
+        workflow_name: Option<String>,
+        next_action: NameInputNextAction,
+    },
+    RenameWorker {
+        buffer: String,
+        worker_id: WorkerId,
+    },
+}
+
+#[derive(Clone)]
+enum NameInputNextAction {
+    CreateWithWorkflow,
+    CreateWithFreePrompt,
 }
 
 struct PermissionPromptState {

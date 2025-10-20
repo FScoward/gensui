@@ -1,3 +1,9 @@
+mod name_validator;
+mod name_registry;
+
+use name_validator::NameValidator;
+use name_registry::NameRegistry;
+
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
@@ -59,6 +65,7 @@ pub struct WorkerSnapshot {
 
 #[derive(Default, Clone, Debug)]
 pub struct CreateWorkerRequest {
+    pub name: Option<String>,
     pub issue: Option<String>,
     pub agent: Option<String>,
     pub workflow: Option<String>,
@@ -86,6 +93,10 @@ pub enum WorkerCommand {
         prompt: String,
         permission_mode: Option<String>,
     },
+    Rename {
+        id: WorkerId,
+        new_name: String,
+    },
     Persist {
         id: WorkerId,
     },
@@ -112,6 +123,11 @@ pub enum WorkerEvent {
     Deleted {
         id: WorkerId,
         message: String,
+    },
+    Renamed {
+        id: WorkerId,
+        old_name: String,
+        new_name: String,
     },
     Error {
         id: Option<WorkerId>,
@@ -187,6 +203,12 @@ impl WorkerHandle {
             .map_err(|err| anyhow!("failed to enqueue worker continuation: {err}"))
     }
 
+    pub fn rename_worker(&self, id: WorkerId, new_name: String) -> Result<()> {
+        self.cmd_tx
+            .send(WorkerCommand::Rename { id, new_name })
+            .map_err(|err| anyhow!("failed to enqueue worker rename: {err}"))
+    }
+
     pub fn respond_permission(
         &self,
         id: WorkerId,
@@ -244,6 +266,8 @@ struct WorkerManager {
     next_id: usize,
     workers: HashMap<WorkerId, WorkerRuntime>,
     pending_permissions: HashMap<u64, PendingPermission>,
+    name_registry: NameRegistry,
+    name_validator: NameValidator,
 }
 
 struct PendingPermission {
@@ -271,6 +295,8 @@ impl WorkerManager {
             next_id,
             workers: HashMap::new(),
             pending_permissions: HashMap::new(),
+            name_registry: NameRegistry::new(),
+            name_validator: NameValidator::new(),
         }
     }
 
@@ -294,6 +320,12 @@ impl WorkerManager {
             }
 
             let worktree_exists = worktree_path.exists();
+
+            // Register worker name
+            if let Err(err) = self.name_registry.register(record.snapshot.name.clone(), worker_id) {
+                eprintln!("Warning: Failed to register worker name '{}': {}", record.snapshot.name, err);
+                // Continue with restoration even if name registration fails
+            }
 
             // Create snapshot from saved data
             let snapshot = WorkerSnapshot {
@@ -415,6 +447,14 @@ impl WorkerManager {
                         });
                     }
                 }
+                WorkerCommand::Rename { id, new_name } => {
+                    if let Err(err) = self.handle_rename(id, new_name) {
+                        let _ = self.evt_tx.send(WorkerEvent::Error {
+                            id: Some(id),
+                            message: err.to_string(),
+                        });
+                    }
+                }
                 WorkerCommand::Persist { id } => {
                     self.persist_worker(id);
                 }
@@ -442,6 +482,28 @@ impl WorkerManager {
         let worker_id = WorkerId(self.next_id);
         self.next_id += 1;
         self.persist_manager_state();
+
+        // Determine worker name
+        let name = if let Some(user_name) = request.name {
+            // Validate user-provided name
+            self.name_validator.validate(&user_name)
+                .map_err(|e| anyhow!("Invalid worker name: {}", e))?;
+
+            // Check availability
+            if !self.name_registry.is_available(&user_name) {
+                return Err(anyhow!("Worker name '{}' is already in use", user_name));
+            }
+
+            user_name
+        } else {
+            // Generate default name
+            let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+            format!("worker-{}-{}", worker_id.0, timestamp)
+        };
+
+        // Register name
+        self.name_registry.register(name.clone(), worker_id)
+            .map_err(|e| anyhow!("Failed to register worker name: {}", e))?;
 
         let (worktree_path, branch, rel_worktree) =
             if let Some((existing_path, existing_branch)) = request.existing_worktree {
@@ -530,7 +592,7 @@ impl WorkerManager {
 
         let snapshot = WorkerSnapshot {
             id: worker_id,
-            name: format!("worker-{}", worker_id.0),
+            name: name.clone(),
             issue,
             agent,
             worktree: rel_worktree.clone(),
@@ -743,6 +805,53 @@ impl WorkerManager {
         // Restart agent with updated workflow
         runtime.start_agent(&self.evt_tx);
 
+        self.persist_worker(id);
+
+        Ok(())
+    }
+
+    fn handle_rename(&mut self, id: WorkerId, new_name: String) -> Result<()> {
+        // Validate new name
+        self.name_validator.validate(&new_name)
+            .map_err(|e| anyhow!("Invalid worker name: {}", e))?;
+
+        // Get worker runtime
+        let runtime = self
+            .workers
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("worker {:?} not found", id))?;
+
+        let old_name = runtime.snapshot().name.clone();
+
+        // Skip if name unchanged
+        if old_name == new_name {
+            return Ok(());
+        }
+
+        // Update name registry
+        self.name_registry.rename(&old_name, new_name.clone(), id)
+            .map_err(|e| anyhow!("Failed to rename worker: {}", e))?;
+
+        // Update snapshot
+        {
+            let mut snapshot = runtime.state.lock().expect("worker snapshot poisoned");
+            snapshot.name = new_name.clone();
+            let _ = self.evt_tx.send(WorkerEvent::Renamed {
+                id,
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            });
+            let _ = self.evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+        }
+
+        // Rename state file
+        if let Err(err) = self.state_store.rename_worker(&old_name, &new_name) {
+            // Rollback name registry on file rename failure
+            let _ = self.name_registry.rename(&new_name, old_name.clone(), id);
+            return Err(anyhow!("Failed to rename worker state file: {}", err));
+        }
+
+        // Persist updated worker
         self.persist_worker(id);
 
         Ok(())

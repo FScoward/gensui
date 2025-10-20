@@ -312,6 +312,113 @@ pub fn render_worktree_selection_modal(
     frame.render_widget(widget, area);
 }
 
+/// Worker名前入力モーダルをレンダリング
+pub fn render_name_input_modal(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    buffer: &str,
+    workflow_name: &Option<String>,
+) {
+    let workflow_text = workflow_name
+        .as_ref()
+        .map(|name| format!("ワークフロー: {}", name))
+        .unwrap_or_else(|| "新規ワーカー".to_string());
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Worker名を入力してください",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::raw(&workflow_text),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("名前: "),
+            Span::styled(
+                buffer,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::raw("Enter: 確定 / Esc: スキップ（デフォルト名を使用）"),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                "※",
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                " 使用可能: 英数字、ハイフン、アンダースコア、日本語 (1-64文字)",
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    ];
+
+    let widget = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Worker Name"));
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
+/// Worker名前変更モーダルをレンダリング
+pub fn render_rename_worker_modal(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    buffer: &str,
+    current_name: &str,
+) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Worker名を変更",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("現在の名前: "),
+            Span::styled(
+                current_name,
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("新しい名前: "),
+            Span::styled(
+                buffer,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::raw("Enter: 確定 / Esc: キャンセル"),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                "※",
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                " 使用可能: 英数字、ハイフン、アンダースコア、日本語 (1-64文字)",
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    ];
+
+    let widget = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Rename Worker"));
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
 /// 許可されたツールの説明テキストを生成
 pub fn describe_allowed_tools(tools: &Option<Vec<String>>) -> String {
     match tools {
