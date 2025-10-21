@@ -6,23 +6,34 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 use crate::state::{SessionEvent, SessionHistory};
 
-/// Claudeのセッションディレクトリを取得
-fn get_claude_sessions_dir() -> Result<PathBuf> {
+/// プロジェクトパスを正規化（/home/user/gensui → -home-user-gensui）
+fn normalize_project_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "-")
+        .replace('\\', "-")
+}
+
+/// Claudeのプロジェクトディレクトリを取得
+fn get_claude_projects_dir(project_path: &Path) -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .context("HOME or USERPROFILE environment variable not set")?;
 
     // Check custom CLAUDE_CONFIG_DIR first
-    if let Ok(custom_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        return Ok(PathBuf::from(custom_dir).join("sessions"));
-    }
+    let claude_dir = if let Ok(custom_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        PathBuf::from(custom_dir)
+    } else {
+        PathBuf::from(home).join(".claude")
+    };
 
-    Ok(PathBuf::from(home).join(".claude").join("sessions"))
+    let normalized = normalize_project_path(project_path);
+    Ok(claude_dir.join("projects").join(normalized))
 }
 
 /// ディレクトリ内の最新のセッションファイルを取得
@@ -37,8 +48,8 @@ fn get_latest_session_file(sessions_dir: &Path, since: Option<OffsetDateTime>) -
         let entry = entry?;
         let path = entry.path();
 
-        // セッションファイルのみ（.jsonファイル）
-        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
+        // セッションファイルのみ（.jsonlファイル）
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
             continue;
         }
 
@@ -68,70 +79,79 @@ fn get_latest_session_file(sessions_dir: &Path, since: Option<OffsetDateTime>) -
     Ok(latest_file.map(|(path, _)| path))
 }
 
-/// セッションファイルをパースしてSessionHistoryに変換
+/// JSONLセッションファイルをパースしてSessionHistoryに変換
 fn parse_session_file(file_path: &Path) -> Result<SessionHistory> {
-    let content = fs::read_to_string(file_path)
-        .with_context(|| format!("Failed to read session file: {}", file_path.display()))?;
+    let file = fs::File::open(file_path)
+        .with_context(|| format!("Failed to open session file: {}", file_path.display()))?;
+    let reader = BufReader::new(file);
 
-    let session: Value = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse session file: {}", file_path.display()))?;
-
-    // セッションIDを取得
-    let session_id = session.get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    // 開始時刻を取得
-    let started_at = session.get("created_at")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|_| "unknown".to_string())
-        });
-
-    // 終了時刻を取得
-    let ended_at = session.get("updated_at")
-        .or_else(|| session.get("ended_at"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // メッセージ履歴からプロンプトとイベントを抽出
+    let mut session_id = String::from("unknown");
+    let mut started_at = String::new();
+    let mut ended_at: Option<String> = None;
     let mut events = Vec::new();
     let mut prompt = String::new();
     let mut total_tool_uses = 0;
     let mut files_modified = Vec::new();
+    let mut first_timestamp = None;
+    let mut last_timestamp = None;
 
-    if let Some(messages) = session.get("messages").and_then(|v| v.as_array()) {
-        for (idx, message) in messages.iter().enumerate() {
-            let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let timestamp = message.get("timestamp")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&started_at)
-                .to_string();
+    // JSONL形式（1行1イベント）をパース
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| {
+            format!("Failed to read line {} from {}", line_num + 1, file_path.display())
+        })?;
 
-            match role {
-                "user" => {
-                    // 最初のユーザーメッセージをプロンプトとする
-                    if idx == 0 || prompt.is_empty() {
-                        if let Some(content) = message.get("content") {
-                            if let Some(text) = content.as_str() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let event: Value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "Failed to parse JSON on line {} in {}",
+                line_num + 1,
+                file_path.display()
+            )
+        })?;
+
+        // セッションIDを取得（最初の行から）
+        if session_id == "unknown" {
+            if let Some(id) = event.get("sessionId").and_then(|v| v.as_str()) {
+                session_id = id.to_string();
+            }
+        }
+
+        // タイムスタンプを記録
+        if let Some(timestamp) = event.get("timestamp").and_then(|v| v.as_str()) {
+            if first_timestamp.is_none() {
+                first_timestamp = Some(timestamp.to_string());
+            }
+            last_timestamp = Some(timestamp.to_string());
+        }
+
+        // イベントタイプを取得
+        let event_type = event.get("type").and_then(|v| v.as_str());
+        let timestamp = event
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        match event_type {
+            Some("user") => {
+                // ユーザーメッセージからプロンプトを抽出
+                if let Some(message) = event.get("message") {
+                    if let Some(content) = message.get("content") {
+                        if let Some(text) = content.as_str() {
+                            // 最初の実質的なユーザーメッセージをプロンプトとする（"Warmup"は除外）
+                            if prompt.is_empty() && text != "Warmup" {
                                 prompt = text.to_string();
-                            } else if let Some(arr) = content.as_array() {
-                                // contentが配列の場合、textブロックを探す
-                                for block in arr {
-                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                        prompt = text.to_string();
-                                        break;
-                                    }
-                                }
                             }
                         }
                     }
                 }
-                "assistant" => {
+            }
+            Some("assistant") => {
+                if let Some(message) = event.get("message") {
                     if let Some(content) = message.get("content") {
                         if let Some(arr) = content.as_array() {
                             for block in arr {
@@ -148,31 +168,6 @@ fn parse_session_file(file_path: &Path) -> Result<SessionHistory> {
                                             }
                                         }
                                     }
-                                    Some("tool_use") => {
-                                        total_tool_uses += 1;
-
-                                        let name = block.get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-
-                                        // ファイル編集ツールの場合、ファイルパスを記録
-                                        if matches!(name.as_str(), "Edit" | "Write") {
-                                            if let Some(input) = block.get("input") {
-                                                if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) {
-                                                    if !files_modified.contains(&file_path.to_string()) {
-                                                        files_modified.push(file_path.to_string());
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        events.push(SessionEvent::ToolUse {
-                                            name,
-                                            timestamp: timestamp.clone(),
-                                            input: block.get("input").cloned(),
-                                        });
-                                    }
                                     Some("thinking") => {
                                         if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
                                             events.push(SessionEvent::ThinkingBlock {
@@ -187,10 +182,56 @@ fn parse_session_file(file_path: &Path) -> Result<SessionHistory> {
                         }
                     }
                 }
-                _ => {}
             }
+            Some("tool_use") => {
+                total_tool_uses += 1;
+
+                let name = event
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                // ファイル編集ツールの場合、ファイルパスを記録
+                if matches!(name.as_str(), "Edit" | "Write") {
+                    if let Some(input) = event.get("input") {
+                        if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) {
+                            if !files_modified.contains(&file_path.to_string()) {
+                                files_modified.push(file_path.to_string());
+                            }
+                        }
+                    }
+                }
+
+                events.push(SessionEvent::ToolUse {
+                    name,
+                    timestamp: timestamp.clone(),
+                    input: event.get("input").cloned(),
+                });
+            }
+            Some("tool_result") => {
+                if let Some(name) = event.get("name").and_then(|v| v.as_str()) {
+                    events.push(SessionEvent::ToolResult {
+                        name: name.to_string(),
+                        timestamp: timestamp.clone(),
+                        output: event
+                            .get("output")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    });
+                }
+            }
+            _ => {}
         }
     }
+
+    // 開始・終了時刻を設定
+    started_at = first_timestamp.unwrap_or_else(|| {
+        OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string())
+    });
+    ended_at = last_timestamp;
 
     Ok(SessionHistory {
         session_id,
@@ -208,8 +249,11 @@ fn parse_session_file(file_path: &Path) -> Result<SessionHistory> {
 }
 
 /// インタラクティブモード終了後に最新のセッションをインポート
-pub fn import_latest_session(since: Option<OffsetDateTime>) -> Result<Option<SessionHistory>> {
-    let sessions_dir = get_claude_sessions_dir()?;
+pub fn import_latest_session(
+    project_path: &Path,
+    since: Option<OffsetDateTime>,
+) -> Result<Option<SessionHistory>> {
+    let sessions_dir = get_claude_projects_dir(project_path)?;
 
     if let Some(latest_file) = get_latest_session_file(&sessions_dir, since)? {
         let history = parse_session_file(&latest_file)?;
@@ -224,8 +268,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_claude_sessions_dir() {
-        let result = get_claude_sessions_dir();
+    fn test_normalize_project_path() {
+        let path = Path::new("/home/user/gensui");
+        assert_eq!(normalize_project_path(path), "-home-user-gensui");
+    }
+
+    #[test]
+    fn test_get_claude_projects_dir() {
+        let project_path = Path::new("/home/user/gensui");
+        let result = get_claude_projects_dir(project_path);
         assert!(result.is_ok());
     }
 }

@@ -91,7 +91,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 
             // Try to import session history from Claude's session files
             println!("\nセッション履歴をインポート中...");
-            match session_import::import_latest_session(Some(session_start_time)) {
+            match session_import::import_latest_session(&request.worktree_path, Some(session_start_time)) {
                 Ok(Some(session_history)) => {
                     println!("✓ セッション履歴をインポートしました");
                     println!("  Session ID: {}", session_history.session_id);
