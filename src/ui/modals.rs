@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use crate::state::{SessionEvent, SessionHistory};
 use crate::worker::{ExistingWorktree, PermissionDecision, PermissionRequest};
 use super::helpers::permission_mode_label;
 use super::types::AVAILABLE_TOOLS;
@@ -447,4 +448,259 @@ mod tests {
         let tools = vec!["Read".to_string(), "Write".to_string()];
         assert_eq!(describe_allowed_tools(&Some(tools)), "Read, Write");
     }
+}
+
+/// セッション履歴モーダルをレンダリング
+pub fn render_session_history_modal(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    sessions: &[SessionHistory],
+    selected_session: usize,
+    scroll: usize,
+) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Session History",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::raw("↑/↓: スクロール  j/k: セッション選択  q/Esc: 閉じる"),
+        Line::raw("━".repeat(area.width as usize)),
+    ];
+
+    if sessions.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "セッション履歴がありません",
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        for (idx, session) in sessions.iter().enumerate() {
+            let is_selected = idx == selected_session;
+
+            // Session header
+            let session_header = format!(
+                "Session #{} [{}]",
+                idx + 1,
+                session.session_id.chars().take(8).collect::<String>()
+            );
+
+            lines.push(Line::raw(""));
+            if is_selected {
+                lines.push(Line::from(Span::styled(
+                    format!("> {}", session_header),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    session_header,
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+
+            // Session metadata
+            lines.push(Line::from(vec![
+                Span::raw("  開始: "),
+                Span::styled(&session.started_at, Style::default().fg(Color::Green)),
+            ]));
+
+            if let Some(ended_at) = &session.ended_at {
+                lines.push(Line::from(vec![
+                    Span::raw("  終了: "),
+                    Span::styled(ended_at, Style::default().fg(Color::Green)),
+                ]));
+            }
+
+            lines.push(Line::from(vec![
+                Span::raw("  プロンプト: "),
+                Span::styled(
+                    truncate_string(&session.prompt, 60),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+
+            lines.push(Line::from(vec![
+                Span::raw("  ツール使用: "),
+                Span::styled(
+                    format!("{} 回", session.total_tool_uses),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]));
+
+            if !session.files_modified.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("  編集ファイル: "),
+                    Span::styled(
+                        format!("{} 件", session.files_modified.len()),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+
+                // Show first few files
+                for (file_idx, file) in session.files_modified.iter().take(3).enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            truncate_string(file, 50),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]));
+
+                    if file_idx == 2 && session.files_modified.len() > 3 {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(
+                                format!("... あと {} 件", session.files_modified.len() - 3),
+                                Style::default().fg(Color::Gray),
+                            ),
+                        ]));
+                    }
+                }
+            }
+
+            // Show event summary if selected
+            if is_selected {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "  イベント:",
+                    Style::default().fg(Color::Cyan),
+                )));
+
+                let event_count = session.events.len().min(10);
+                for event in session.events.iter().take(event_count) {
+                    let event_line = match event {
+                        SessionEvent::ToolUse { name, timestamp, .. } => {
+                            Line::from(vec![
+                                Span::raw("    🔧 "),
+                                Span::styled(name, Style::default().fg(Color::Blue)),
+                                Span::raw(" @ "),
+                                Span::styled(
+                                    format_timestamp(timestamp),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ])
+                        }
+                        SessionEvent::AssistantMessage { text, timestamp } => {
+                            Line::from(vec![
+                                Span::raw("    💬 "),
+                                Span::styled(
+                                    truncate_string(text, 50),
+                                    Style::default().fg(Color::White),
+                                ),
+                                Span::raw(" @ "),
+                                Span::styled(
+                                    format_timestamp(timestamp),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ])
+                        }
+                        SessionEvent::ThinkingBlock { timestamp, .. } => {
+                            Line::from(vec![
+                                Span::raw("    💭 "),
+                                Span::styled("Thinking...", Style::default().fg(Color::Magenta)),
+                                Span::raw(" @ "),
+                                Span::styled(
+                                    format_timestamp(timestamp),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ])
+                        }
+                        SessionEvent::Result { text, is_error, timestamp } => {
+                            let icon = if *is_error { "❌" } else { "✅" };
+                            let color = if *is_error { Color::Red } else { Color::Green };
+                            Line::from(vec![
+                                Span::raw(format!("    {} ", icon)),
+                                Span::styled(
+                                    truncate_string(text, 50),
+                                    Style::default().fg(color),
+                                ),
+                                Span::raw(" @ "),
+                                Span::styled(
+                                    format_timestamp(timestamp),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ])
+                        }
+                        SessionEvent::Error { message, timestamp } => {
+                            Line::from(vec![
+                                Span::raw("    ⚠️  "),
+                                Span::styled(
+                                    truncate_string(message, 50),
+                                    Style::default().fg(Color::Red),
+                                ),
+                                Span::raw(" @ "),
+                                Span::styled(
+                                    format_timestamp(timestamp),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ])
+                        }
+                        SessionEvent::ToolResult { name, timestamp, .. } => {
+                            Line::from(vec![
+                                Span::raw("    ✓  "),
+                                Span::styled(
+                                    format!("{} result", name),
+                                    Style::default().fg(Color::Green),
+                                ),
+                                Span::raw(" @ "),
+                                Span::styled(
+                                    format_timestamp(timestamp),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ])
+                        }
+                    };
+                    lines.push(event_line);
+                }
+
+                if session.events.len() > event_count {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            format!("... あと {} イベント", session.events.len() - event_count),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+
+    // Apply scroll offset
+    let display_lines: Vec<Line> = lines.into_iter().skip(scroll).collect();
+
+    let widget = Paragraph::new(display_lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Session History"),
+        );
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
+}
+
+/// 文字列を指定長で切り詰める
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+/// タイムスタンプをフォーマット
+fn format_timestamp(timestamp: &str) -> String {
+    // RFC3339形式のタイムスタンプから時刻部分のみを抽出
+    if let Some(time_part) = timestamp.split('T').nth(1) {
+        if let Some(time_only) = time_part.split('.').next() {
+            return time_only.to_string();
+        }
+    }
+    timestamp.to_string()
 }
