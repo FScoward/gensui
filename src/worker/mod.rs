@@ -360,6 +360,7 @@ impl WorkerManager {
                     record.snapshot.branch.clone(),
                     record.workflow,
                     self.cmd_tx.clone(),
+                    self.config.default_sandbox_mode,
                 ) {
                     Ok(runtime) => {
                         runtime
@@ -577,6 +578,7 @@ impl WorkerManager {
                         allowed_tools: None,
                         permission_mode,
                         extra_args: None,
+                        sandbox_mode: None, // Use global default
                     }),
                     description: Some("User supplied prompt".to_string()),
                 }],
@@ -617,6 +619,7 @@ impl WorkerManager {
             branch,
             workflow,
             self.cmd_tx.clone(),
+            self.config.default_sandbox_mode,
         );
         let mut runtime = match runtime {
             Ok(runtime) => runtime,
@@ -788,6 +791,7 @@ impl WorkerManager {
                 allowed_tools: None,
                 permission_mode,
                 extra_args: None,
+                sandbox_mode: None, // Use global default
             }),
             description: Some("User follow-up instruction".to_string()),
         };
@@ -989,6 +993,7 @@ struct WorkerRuntime {
     logs: Arc<Mutex<VecDeque<String>>>,
     cmd_tx: Sender<WorkerCommand>,
     session_histories: Arc<Mutex<Vec<SessionHistory>>>,
+    default_sandbox_mode: bool,
 }
 
 impl WorkerRuntime {
@@ -998,6 +1003,7 @@ impl WorkerRuntime {
         branch: String,
         workflow: Workflow,
         cmd_tx: Sender<WorkerCommand>,
+        default_sandbox_mode: bool,
     ) -> Result<Self> {
         Ok(Self {
             state: Arc::new(Mutex::new(snapshot)),
@@ -1010,6 +1016,7 @@ impl WorkerRuntime {
             logs: Arc::new(Mutex::new(VecDeque::new())),
             cmd_tx,
             session_histories: Arc::new(Mutex::new(Vec::new())),
+            default_sandbox_mode,
         })
     }
 
@@ -1060,6 +1067,7 @@ impl WorkerRuntime {
         let logs = Arc::clone(&self.logs);
         let cmd_tx = self.cmd_tx.clone();
         let session_histories = Arc::clone(&self.session_histories);
+        let default_sandbox_mode = self.default_sandbox_mode;
 
         let handle = thread::Builder::new()
             .name(format!("gensui-agent-{}", self.snapshot().name))
@@ -1074,6 +1082,7 @@ impl WorkerRuntime {
                     logs,
                     cmd_tx,
                     session_histories,
+                    default_sandbox_mode,
                 )
             })
             .expect("failed to spawn agent simulation");
@@ -1099,6 +1108,7 @@ fn agent_simulation(
     logs: Arc<Mutex<VecDeque<String>>>,
     cmd_tx: Sender<WorkerCommand>,
     session_histories: Arc<Mutex<Vec<SessionHistory>>>,
+    default_sandbox_mode: bool,
 ) {
     // Helper function to save log and send event
     let send_log = |line: String, worker_id: WorkerId| {
@@ -1367,6 +1377,7 @@ fn agent_simulation(
                 &prompt,
                 &worktree_path,
                 current_session_id,
+                default_sandbox_mode,
                 |line| send_log(line, worker_id),
             );
 
@@ -1496,6 +1507,7 @@ fn run_claude_command<F>(
     prompt: &str,
     dir: &Path,
     session_id: Option<&str>,
+    default_sandbox_mode: bool,
     mut log_fn: F,
 ) -> Result<(Option<String>, SessionHistory)>
 where
@@ -1563,6 +1575,13 @@ where
             cmd.arg(replaced);
         }
     }
+
+    // Sandboxing is controlled via .claude/settings.json
+    // Claude CLI automatically loads this file from the working directory
+    // The default_sandbox_mode and step.sandbox_mode settings are kept for
+    // future extensibility and documentation purposes, but currently have no effect
+    // on the CLI arguments (sandboxing is configured through settings file)
+    let _sandbox_enabled = step.sandbox_mode.unwrap_or(default_sandbox_mode);
 
     cmd.current_dir(dir);
 

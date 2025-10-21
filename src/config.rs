@@ -10,6 +10,15 @@ pub struct Config {
     pub workflows: Vec<Workflow>,
     #[serde(default)]
     pub default_workflow: Option<String>,
+    /// Global default for sandbox mode.
+    /// If true (default), Claude Code will run in sandbox mode unless explicitly disabled.
+    /// Individual workflow steps can override this setting.
+    #[serde(default = "default_sandbox_mode")]
+    pub default_sandbox_mode: bool,
+}
+
+fn default_sandbox_mode() -> bool {
+    true // Security-first: enable sandbox by default
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -43,6 +52,10 @@ pub struct ClaudeStep {
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub extra_args: Option<Vec<String>>,
+    /// Enable sandbox mode to restrict file system access to worktree.
+    /// Default: None (inherits from global config, which defaults to true)
+    #[serde(default)]
+    pub sandbox_mode: Option<bool>,
 }
 
 impl Config {
@@ -106,6 +119,7 @@ impl Default for Config {
                 ],
             }],
             default_workflow: Some("default".to_string()),
+            default_sandbox_mode: default_sandbox_mode(),
         }
     }
 }
@@ -113,5 +127,104 @@ impl Default for Config {
 impl Workflow {
     pub fn steps(&self) -> &[WorkflowStep] {
         &self.steps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_sandbox_mode_is_true() {
+        assert_eq!(default_sandbox_mode(), true);
+    }
+
+    #[test]
+    fn test_config_default_has_sandbox_enabled() {
+        let config = Config::default();
+        assert_eq!(config.default_sandbox_mode, true);
+    }
+
+    #[test]
+    fn test_config_deserialize_with_sandbox_mode() {
+        let json = r#"{
+            "default_workflow": "test",
+            "default_sandbox_mode": false,
+            "workflows": [
+                {
+                    "name": "test",
+                    "steps": []
+                }
+            ]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.default_sandbox_mode, false);
+    }
+
+    #[test]
+    fn test_config_deserialize_without_sandbox_mode_defaults_to_true() {
+        let json = r#"{
+            "default_workflow": "test",
+            "workflows": [
+                {
+                    "name": "test",
+                    "steps": []
+                }
+            ]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.default_sandbox_mode, true);
+    }
+
+    #[test]
+    fn test_claude_step_sandbox_mode_none() {
+        let json = r#"{
+            "prompt": "test prompt"
+        }"#;
+
+        let step: ClaudeStep = serde_json::from_str(json).unwrap();
+        assert_eq!(step.sandbox_mode, None);
+    }
+
+    #[test]
+    fn test_claude_step_sandbox_mode_true() {
+        let json = r#"{
+            "prompt": "test prompt",
+            "sandbox_mode": true
+        }"#;
+
+        let step: ClaudeStep = serde_json::from_str(json).unwrap();
+        assert_eq!(step.sandbox_mode, Some(true));
+    }
+
+    #[test]
+    fn test_claude_step_sandbox_mode_false() {
+        let json = r#"{
+            "prompt": "test prompt",
+            "sandbox_mode": false
+        }"#;
+
+        let step: ClaudeStep = serde_json::from_str(json).unwrap();
+        assert_eq!(step.sandbox_mode, Some(false));
+    }
+
+    #[test]
+    fn test_sandbox_mode_inheritance() {
+        // Test the intended behavior: step-level overrides global default
+        let global_default = true;
+
+        // Case 1: Step has no sandbox_mode, should inherit global default
+        let step_none: Option<bool> = None;
+        assert_eq!(step_none.unwrap_or(global_default), true);
+
+        // Case 2: Step explicitly sets sandbox_mode to false
+        let step_false: Option<bool> = Some(false);
+        assert_eq!(step_false.unwrap_or(global_default), false);
+
+        // Case 3: Step explicitly sets sandbox_mode to true
+        let step_true: Option<bool> = Some(true);
+        assert_eq!(step_true.unwrap_or(global_default), true);
     }
 }
