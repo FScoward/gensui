@@ -685,12 +685,14 @@ pub fn render_session_history_modal(
     frame.render_widget(widget, area);
 }
 
-/// 文字列を指定長で切り詰める
+/// 文字列を指定長で切り詰める（文字数ベース、マルチバイト文字対応）
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
 
