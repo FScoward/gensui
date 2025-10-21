@@ -1,5 +1,6 @@
 {
   "default_workflow": "default",
+  "default_sandbox_mode": true,
   "workflows": [
     {
       "name": "default",
@@ -61,6 +62,33 @@
         {
           "name": "テスト実行",
           "command": "echo '[テスト] 実装が完了しました。テストを実行してください。'"
+        }
+      ]
+    },
+    {
+      "name": "claude-sandbox-demo",
+      "description": "Sandbox設定のデモ（ステップごとにsandboxを制御）",
+      "steps": [
+        {
+          "name": "安全な分析",
+          "description": "Sandboxモードで安全に分析（デフォルト）",
+          "claude": {
+            "prompt": "コードベースの構造を分析してください",
+            "model": "sonnet",
+            "permission_mode": "plan",
+            "allowed_tools": ["Read", "Grep", "Glob"]
+          }
+        },
+        {
+          "name": "Sandboxなし実装",
+          "description": "特別な理由でsandboxを無効化する例（非推奨）",
+          "claude": {
+            "prompt": "システム全体に影響する設定変更を実装してください",
+            "model": "sonnet",
+            "permission_mode": "acceptEdits",
+            "allowed_tools": ["Read", "Write", "Edit", "Bash"],
+            "sandbox_mode": false
+          }
         }
       ]
     }
