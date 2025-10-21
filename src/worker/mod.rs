@@ -1576,14 +1576,12 @@ where
         }
     }
 
-    // Sandbox mode: step-level config overrides global default
-    // Default is true (enabled) for security
-    let sandbox_enabled = step.sandbox_mode.unwrap_or(default_sandbox_mode);
-    if sandbox_enabled {
-        cmd.arg("--sandbox");
-    } else {
-        cmd.arg("--dangerouslyOverrideSandbox");
-    }
+    // Sandboxing is controlled via .claude/settings.json
+    // Claude CLI automatically loads this file from the working directory
+    // The default_sandbox_mode and step.sandbox_mode settings are kept for
+    // future extensibility and documentation purposes, but currently have no effect
+    // on the CLI arguments (sandboxing is configured through settings file)
+    let _sandbox_enabled = step.sandbox_mode.unwrap_or(default_sandbox_mode);
 
     cmd.current_dir(dir);
 

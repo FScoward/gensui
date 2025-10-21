@@ -60,9 +60,18 @@ GensuiではHeadless CLI方式を標準とし、`command-group`でプロセス�
 ## パーミッションと安全性
 - 基本ポリシー: `--allowedTools "Read,Write,Edit,Bash,Grep" --permission-mode acceptEdits`
 - **Sandboxモード**: デフォルトで有効。Claude Codeのファイルシステムアクセスをworktree内に制限し、システム全体への予期しない変更を防止
-  - グローバル設定: `workflows.json`の`default_sandbox_mode`（デフォルト: `true`）
-  - ステップ単位の制御: 各Claudeステップで`sandbox_mode: false`を指定すると無効化可能（非推奨）
-  - セキュリティ優先の設計により、意図しない場合を除きsandboxは常に有効
+  - **設定方法**: `.claude/settings.json`で制御（プロジェクトルートに配置）
+  - **デフォルト設定**:
+    ```json
+    {
+      "sandbox": {
+        "enabled": true,
+        "autoAllowBashIfSandboxed": true
+      }
+    }
+    ```
+  - セキュリティ優先の設計により、デフォルトでsandboxは常に有効
+  - 無効化する場合は`.claude/settings.local.json`で`"enabled": false`を設定（非推奨）
 - `.claude/settings.json`でプロジェクト固有ルールをホワイトリスト/ブラックリスト管理
 - 機密ファイル (`.env`, `secrets/**`) へのアクセスは明示的に拒否
 - 危険コマンド (`rm`, `curl`など) は許可制。実行前に差分やコマンドを確認するガードを実装
@@ -175,31 +184,30 @@ cargo run
 
 ##### Sandboxモードの設定
 
-デフォルトではすべてのClaude Codeステップでsandboxモードが有効です。特定のステップでsandboxを無効化する場合は`sandbox_mode: false`を明示的に指定します（セキュリティリスクを理解した上で使用してください）。
+デフォルトではすべてのClaude Codeステップでsandboxモードが有効です。Sandboxingは`.claude/settings.json`で制御します。
+
+プロジェクトルートに`.claude/settings.json`を配置することで、すべてのClaude Code実行に適用されます：
 
 ```json
 {
-  "name": "システム設定の変更",
-  "description": "Worktree外部のシステム設定を変更する（非推奨）",
-  "claude": {
-    "prompt": "グローバル設定ファイルを更新してください",
-    "model": "sonnet",
-    "permission_mode": "acceptEdits",
-    "allowed_tools": ["Read", "Write", "Edit", "Bash"],
-    "sandbox_mode": false
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
   }
 }
 ```
 
-グローバルにsandboxモードを無効化する場合は、`workflows.json`のトップレベルで設定します（通常は推奨しません）:
+Sandboxを無効化する必要がある場合（非推奨）、`.claude/settings.local.json`で上書きできます：
 
 ```json
 {
-  "default_workflow": "default",
-  "default_sandbox_mode": false,
-  "workflows": [ ... ]
+  "sandbox": {
+    "enabled": false
+  }
 }
 ```
+
+**注意**: `.claude/settings.local.json`は個人用設定ファイルで、gitにコミットされません。チーム全体のセキュリティポリシーは`.claude/settings.json`で管理してください。
 
 テンプレートでは`{{issue}}`、`{{branch}}`、`{{worktree}}`、`{{worker}}`が利用できます。`extra_args`はCLI引数をそのまま追加し、`{{prompt}}`や`{{workdir}}`プレースホルダを埋め込みます。
 
