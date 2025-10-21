@@ -10,6 +10,7 @@ pub struct WorkerView {
     pub snapshot: WorkerSnapshot,
     pub logs: VecDeque<String>,
     pub structured_logs: Vec<LogEntry>,
+    #[allow(dead_code)]
     pub session_histories: Vec<SessionHistory>,
     // Parser
     log_parser: log_parser::LogParser,
@@ -28,6 +29,7 @@ impl WorkerView {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_session_histories(&mut self, histories: Vec<SessionHistory>) {
         self.session_histories = histories;
     }

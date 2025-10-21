@@ -125,6 +125,7 @@ pub enum WorkerEvent {
         message: String,
     },
     Renamed {
+        #[allow(dead_code)]
         id: WorkerId,
         old_name: String,
         new_name: String,
