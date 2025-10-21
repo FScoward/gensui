@@ -17,6 +17,7 @@ fn normalize_project_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('/', "-")
         .replace('\\', "-")
+        .replace('.', "-")
 }
 
 /// Claudeのプロジェクトディレクトリを取得
