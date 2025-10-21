@@ -264,6 +264,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         Line::raw("PgUp/PgDn – ログを10行スクロール"),
         Line::raw("Home/End – ログの先頭/末尾へジャンプ"),
         Line::raw("l – 選択ワーカーのログを表示"),
+        Line::raw("s – 選択ワーカーのセッション履歴を表示"),
         Line::raw("h – このヘルプを表示"),
         Line::raw("Shift+C – アクションログを圧縮"),
         Line::raw("Shift+I – インタラクティブClaude Code起動（権限を手動承認可能）"),

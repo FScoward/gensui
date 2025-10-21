@@ -27,6 +27,7 @@ impl NameRegistry {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn unregister(&mut self, name: &str) {
         self.name_to_id.remove(name);
     }
@@ -54,6 +55,7 @@ impl NameRegistry {
         !self.name_to_id.contains_key(name)
     }
 
+    #[allow(dead_code)]
     pub fn get_id(&self, name: &str) -> Option<WorkerId> {
         self.name_to_id.get(name).copied()
     }

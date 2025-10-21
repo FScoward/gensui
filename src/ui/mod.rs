@@ -15,7 +15,7 @@ pub use log_view::{prepare_raw_log_data, render_detail_tab, render_log_modal, re
 pub use modals::{
     describe_allowed_tools, render_create_selection_modal, render_modal,
     render_name_input_modal, render_permission_modal, render_prompt_modal,
-    render_rename_worker_modal, render_tool_selection_modal,
+    render_rename_worker_modal, render_session_history_modal, render_tool_selection_modal,
     render_worktree_selection_modal,
 };
 pub use render::{help_lines, render_footer, render_header, render_table};

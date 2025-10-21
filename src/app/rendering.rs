@@ -7,7 +7,7 @@ use crate::ui::{
     centered_rect, help_lines, prepare_raw_log_data, render_create_selection_modal,
     render_detail_tab, render_footer, render_header, render_log_modal, render_modal,
     render_name_input_modal, render_overview_tab, render_permission_modal, render_prompt_modal,
-    render_rename_worker_modal, render_table, render_tool_selection_modal,
+    render_rename_worker_modal, render_session_history_modal, render_table, render_tool_selection_modal,
     render_worktree_selection_modal, LogViewMode,
 };
 use crate::worker::{ExistingWorktree, WorkerSnapshot};
@@ -37,6 +37,10 @@ impl App {
 
         if self.show_help {
             self.render_modal(frame, 60, 50, "Help", self.help_lines());
+        }
+
+        if self.show_session_history {
+            self.render_session_history_modal(frame);
         }
 
         if let Some(prompt) = &self.permission_prompt {
@@ -257,5 +261,17 @@ impl App {
             let lines = vec![Line::raw("ワーカーが選択されていません。")];
             render_log_modal(frame, area, "Detail", lines);
         }
+    }
+
+    fn render_session_history_modal(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = centered_rect(85, 80, frame.area());
+        let sessions = self.get_selected_worker_session_histories();
+        render_session_history_modal(
+            frame,
+            area,
+            &sessions,
+            self.selected_session,
+            self.session_history_scroll,
+        );
     }
 }

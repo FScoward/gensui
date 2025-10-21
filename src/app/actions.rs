@@ -358,10 +358,12 @@ impl App {
 
                 let worktree_path = self.repo_root.join(&worker.snapshot.worktree);
                 let worker_name = worker.snapshot.name.clone();
+                let session_id = worker.snapshot.session_id.clone();
 
                 self.pending_interactive_mode = Some(InteractiveRequest {
                     worker_name,
                     worktree_path,
+                    session_id,
                 });
             }
         } else {
@@ -477,5 +479,25 @@ impl App {
         // Reset log view state when switching workers
         self.selected_step = 0;
         self.log_scroll = 0;
+    }
+
+    /// Toggle session history view
+    pub fn toggle_session_history(&mut self) {
+        self.show_session_history = !self.show_session_history;
+        // Reset scroll and selection when opening
+        if self.show_session_history {
+            self.session_history_scroll = 0;
+            self.selected_session = 0;
+        }
+    }
+
+    /// Scroll session history view up
+    pub fn scroll_session_history_up(&mut self) {
+        self.session_history_scroll = self.session_history_scroll.saturating_sub(1);
+    }
+
+    /// Scroll session history view down
+    pub fn scroll_session_history_down(&mut self) {
+        self.session_history_scroll += 1;
     }
 }

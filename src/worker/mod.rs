@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::{ClaudeStep, Config, Workflow, WorkflowStep};
-use crate::state::{ManagerState, StateStore};
+use crate::state::{ManagerState, SessionEvent, SessionHistory, StateStore};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -125,6 +125,7 @@ pub enum WorkerEvent {
         message: String,
     },
     Renamed {
+        #[allow(dead_code)]
         id: WorkerId,
         old_name: String,
         new_name: String,
@@ -368,6 +369,11 @@ impl WorkerManager {
                         // Restore logs to runtime
                         for log_line in &record.logs {
                             runtime.add_log(log_line.clone());
+                        }
+
+                        // Restore session histories
+                        for session_history in &record.session_history {
+                            runtime.add_session_history(session_history.clone());
                         }
 
                         self.workers.insert(worker_id, runtime);
@@ -942,6 +948,7 @@ impl WorkerManager {
 
             let snapshot = runtime.snapshot();
             let logs = runtime.get_logs();
+            let session_history = runtime.get_session_histories();
 
             let record = WorkerRecord {
                 snapshot: WorkerSnapshotData {
@@ -961,6 +968,7 @@ impl WorkerManager {
                 logs,
                 workflow: runtime.workflow.clone(),
                 completed_steps: runtime.completed_steps.load(Ordering::SeqCst),
+                session_history,
             };
 
             if let Err(err) = self.state_store.save_worker(&record) {
@@ -980,6 +988,7 @@ struct WorkerRuntime {
     completed_steps: Arc<AtomicUsize>,
     logs: Arc<Mutex<VecDeque<String>>>,
     cmd_tx: Sender<WorkerCommand>,
+    session_histories: Arc<Mutex<Vec<SessionHistory>>>,
 }
 
 impl WorkerRuntime {
@@ -1000,7 +1009,21 @@ impl WorkerRuntime {
             completed_steps: Arc::new(AtomicUsize::new(0)),
             logs: Arc::new(Mutex::new(VecDeque::new())),
             cmd_tx,
+            session_histories: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    fn get_session_histories(&self) -> Vec<SessionHistory> {
+        self.session_histories
+            .lock()
+            .map(|histories| histories.clone())
+            .unwrap_or_default()
+    }
+
+    fn add_session_history(&self, history: SessionHistory) {
+        if let Ok(mut histories) = self.session_histories.lock() {
+            histories.push(history);
+        }
     }
 
     fn snapshot(&self) -> WorkerSnapshot {
@@ -1036,6 +1059,7 @@ impl WorkerRuntime {
         let completed_steps = Arc::clone(&self.completed_steps);
         let logs = Arc::clone(&self.logs);
         let cmd_tx = self.cmd_tx.clone();
+        let session_histories = Arc::clone(&self.session_histories);
 
         let handle = thread::Builder::new()
             .name(format!("gensui-agent-{}", self.snapshot().name))
@@ -1049,6 +1073,7 @@ impl WorkerRuntime {
                     completed_steps,
                     logs,
                     cmd_tx,
+                    session_histories,
                 )
             })
             .expect("failed to spawn agent simulation");
@@ -1073,6 +1098,7 @@ fn agent_simulation(
     completed_steps: Arc<AtomicUsize>,
     logs: Arc<Mutex<VecDeque<String>>>,
     cmd_tx: Sender<WorkerCommand>,
+    session_histories: Arc<Mutex<Vec<SessionHistory>>>,
 ) {
     // Helper function to save log and send event
     let send_log = |line: String, worker_id: WorkerId| {
@@ -1350,11 +1376,19 @@ fn agent_simulation(
             send_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string(), worker_id);
             send_log("".to_string(), worker_id);
 
-            // Store the session_id back into the snapshot
-            if let Ok(Some(new_session_id)) = &result {
-                if let Ok(mut snapshot) = state.lock() {
-                    snapshot.session_id = Some(new_session_id.clone());
-                    let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+            // Store the session_id and session_history
+            if let Ok((new_session_id, session_history)) = &result {
+                // Update session_id in snapshot
+                if let Some(sid) = new_session_id {
+                    if let Ok(mut snapshot) = state.lock() {
+                        snapshot.session_id = Some(sid.clone());
+                        let _ = evt_tx.send(WorkerEvent::Updated(snapshot.clone()));
+                    }
+                }
+
+                // Add session history
+                if let Ok(mut histories) = session_histories.lock() {
+                    histories.push(session_history.clone());
                 }
             }
 
@@ -1463,10 +1497,11 @@ fn run_claude_command<F>(
     dir: &Path,
     session_id: Option<&str>,
     mut log_fn: F,
-) -> Result<Option<String>>
+) -> Result<(Option<String>, SessionHistory)>
 where
     F: FnMut(String),
 {
+    let start_time = OffsetDateTime::now_utc();
     let binary = env::var("GENSUI_CLAUDE_BIN").unwrap_or_else(|_| {
         // Try to find claude in common locations
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -1540,6 +1575,9 @@ where
 
     let mut extracted_session_id: Option<String> = None;
     let mut stderr_lines = Vec::new();
+    let mut session_events: Vec<SessionEvent> = Vec::new();
+    let mut total_tool_uses = 0;
+    let mut files_modified: Vec<String> = Vec::new();
 
     // Capture stderr in a separate thread
     let stderr_handle = child.stderr.take().map(|stderr| {
@@ -1571,14 +1609,27 @@ where
 
             // Try to parse as JSON
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                let event_time = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string());
+
                 // Extract thinking/analysis
                 let thought_lines = extract_thinking_lines(&json);
                 if !thought_lines.is_empty() {
                     log_fn("[THOUGHT_START]".to_string());
+                    let mut thinking_content = String::new();
                     for thought_line in thought_lines {
-                        log_fn(thought_line);
+                        log_fn(thought_line.clone());
+                        thinking_content.push_str(&thought_line);
+                        thinking_content.push('\n');
                     }
                     log_fn("[THOUGHT_END]".to_string());
+
+                    if !thinking_content.is_empty() {
+                        session_events.push(SessionEvent::ThinkingBlock {
+                            content: thinking_content.trim().to_string(),
+                            timestamp: event_time.clone(),
+                        });
+                    }
                 }
 
                 match json.get("type").and_then(|v| v.as_str()) {
@@ -1589,8 +1640,10 @@ where
                         }
                     }
                     Some("result") => {
+                        let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+
                         // Check for errors first
-                        if let Some(true) = json.get("is_error").and_then(|v| v.as_bool()) {
+                        if is_error {
                             log_fn("⚠️  Claude encountered an error".to_string());
                         }
 
@@ -1601,23 +1654,41 @@ where
                                 for result_line in result_text.lines() {
                                     log_fn(result_line.to_string());
                                 }
+
+                                session_events.push(SessionEvent::Result {
+                                    text: result_text.to_string(),
+                                    is_error,
+                                    timestamp: event_time.clone(),
+                                });
                             }
                         }
                     }
                     Some("error") => {
                         // API error response
                         log_fn("❌ API Error:".to_string());
+                        let mut error_message = String::new();
                         if let Some(error_obj) = json.get("error") {
                             if let Some(message) = error_obj.get("message").and_then(|v| v.as_str()) {
                                 log_fn(format!("  {}", message));
+                                error_message = message.to_string();
                             }
                         }
+
+                        session_events.push(SessionEvent::Error {
+                            message: error_message,
+                            timestamp: event_time.clone(),
+                        });
                     }
                     Some("assistant") => {
                         // Log assistant messages
                         if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
                             if !text.trim().is_empty() {
                                 log_fn(format!("💬 {}", text));
+
+                                session_events.push(SessionEvent::AssistantMessage {
+                                    text: text.to_string(),
+                                    timestamp: event_time.clone(),
+                                });
                             }
                         }
                     }
@@ -1625,6 +1696,38 @@ where
                         // Log tool usage
                         if let Some(tool_name) = json.get("name").and_then(|v| v.as_str()) {
                             log_fn(format!("🔧 Using tool: {}", tool_name));
+
+                            total_tool_uses += 1;
+
+                            // Extract file path for file modification tools
+                            if matches!(tool_name, "Edit" | "Write") {
+                                if let Some(input) = json.get("input") {
+                                    if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) {
+                                        if !files_modified.contains(&file_path.to_string()) {
+                                            files_modified.push(file_path.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
+                            session_events.push(SessionEvent::ToolUse {
+                                name: tool_name.to_string(),
+                                timestamp: event_time.clone(),
+                                input: json.get("input").cloned(),
+                            });
+                        }
+                    }
+                    Some("tool_result") => {
+                        if let Some(tool_name) = json.get("tool_use_id").and_then(|v| v.as_str()) {
+                            let output = json.get("content")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+
+                            session_events.push(SessionEvent::ToolResult {
+                                name: tool_name.to_string(),
+                                timestamp: event_time.clone(),
+                                output,
+                            });
                         }
                     }
                     _ => {
@@ -1659,6 +1762,8 @@ where
         }
     }
 
+    let end_time = OffsetDateTime::now_utc();
+
     if !status.success() {
         let mut error_msg = format!("Claude CLI exited with status {}", status);
         if !stderr_lines.is_empty() {
@@ -1668,7 +1773,20 @@ where
         return Err(anyhow!("{}", error_msg));
     }
 
-    Ok(extracted_session_id)
+    // Build session history
+    let session_history = SessionHistory {
+        session_id: extracted_session_id.clone().unwrap_or_else(|| "unknown".to_string()),
+        started_at: start_time.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string()),
+        ended_at: Some(end_time.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string())),
+        prompt: prompt.to_string(),
+        events: session_events,
+        total_tool_uses,
+        files_modified,
+    };
+
+    Ok((extracted_session_id, session_history))
 }
 
 fn extract_thinking_lines(json: &serde_json::Value) -> Vec<String> {

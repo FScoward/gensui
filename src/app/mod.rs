@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{Config, Workflow};
-use crate::state::{ActionLogEntry, StateStore};
+use crate::state::{ActionLogEntry, SessionHistory, StateStore};
 use crate::ui::{format_action_log, LogViewMode};
 use crate::worker::{
     spawn_worker_system, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
@@ -37,6 +37,9 @@ pub struct App {
     pub selected: usize,
     pub show_help: bool,
     pub show_logs: bool,
+    pub show_session_history: bool,
+    pub session_history_scroll: usize,
+    pub selected_session: usize,
     pub log_messages: VecDeque<String>,
     pub log_scroll: usize,
     pub status_filter: Option<WorkerStatus>,
@@ -47,6 +50,7 @@ pub struct App {
     pub permission_prompt: Option<types::PermissionPromptState>,
     pub permission_tracker: HashMap<u64, types::PermissionTrackerEntry>,
     pub pending_interactive_mode: Option<types::InteractiveRequest>,
+    pub imported_session_history: Option<(String, SessionHistory)>,
     pub auto_scroll_logs: bool,
 }
 
@@ -100,6 +104,9 @@ impl App {
             selected: 0,
             show_help: false,
             show_logs: false,
+            show_session_history: false,
+            session_history_scroll: 0,
+            selected_session: 0,
             log_messages,
             log_scroll: 0,
             status_filter: None,
@@ -110,6 +117,7 @@ impl App {
             permission_prompt: None,
             permission_tracker: HashMap::new(),
             pending_interactive_mode: None,
+            imported_session_history: None,
             auto_scroll_logs: true,
         })
     }
@@ -153,6 +161,16 @@ impl App {
             let view = &mut self.workers[pos];
             view.push_log(line);
         }
+    }
+
+    pub fn get_selected_worker_session_histories(&self) -> Vec<crate::state::SessionHistory> {
+        if let Some(worker_view) = self.selected_worker_view() {
+            // Load session history from state store
+            if let Ok(Some(record)) = self.state_store.load_worker(&worker_view.snapshot.name) {
+                return record.session_history;
+            }
+        }
+        Vec::new()
     }
 
     pub fn selected_worker_id(&self) -> Option<WorkerId> {

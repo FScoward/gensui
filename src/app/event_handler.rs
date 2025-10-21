@@ -354,6 +354,7 @@ impl App {
             KeyCode::Char('i') => self.start_free_prompt(),
             KeyCode::Char('h') => self.toggle_help(),
             KeyCode::Char('l') => self.toggle_logs(),
+            KeyCode::Char('s') => self.toggle_session_history(),
             KeyCode::Char('w') => self.cycle_workflow(),
             KeyCode::Char('a') => self.cycle_filter(),
             KeyCode::Tab => {
@@ -372,7 +373,9 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                if self.show_logs
+                if self.show_session_history {
+                    self.show_session_history = false;
+                } else if self.show_logs
                     && (self.log_view_mode == LogViewMode::Detail
                         || self.log_view_mode == LogViewMode::Raw)
                 {
@@ -380,7 +383,9 @@ impl App {
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.show_logs {
+                if self.show_session_history {
+                    self.scroll_session_history_up();
+                } else if self.show_logs {
                     match self.log_view_mode {
                         LogViewMode::Overview => self.select_step_up(),
                         LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_up(),
@@ -390,7 +395,9 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.show_logs {
+                if self.show_session_history {
+                    self.scroll_session_history_down();
+                } else if self.show_logs {
                     match self.log_view_mode {
                         LogViewMode::Overview => self.select_step_down(),
                         LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_down(),
@@ -555,6 +562,8 @@ impl App {
             match event {
                 WorkerEvent::Created(snapshot) => {
                     self.add_or_update_worker(snapshot.clone());
+                    // Reset status filter when creating a new worker to ensure it's visible
+                    self.status_filter = None;
                     self.push_log_with_worker(
                         Some(&snapshot.name),
                         format!(
