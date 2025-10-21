@@ -135,17 +135,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                         // Add the new session to history
                         record.session_history.push(session_history.clone());
 
-                        // Persist updated record
-                        if let Err(e) = app.state_store.persist_worker(&record) {
-                            eprintln!("Failed to persist session history: {}", e);
-                        }
-
                         // Update session_id if available
                         if !session_history.session_id.is_empty() && session_history.session_id != "unknown" {
-                            record.session_id = Some(session_history.session_id.clone());
-                            if let Err(e) = app.state_store.persist_worker(&record) {
-                                eprintln!("Failed to persist session ID: {}", e);
-                            }
+                            record.snapshot.session_id = Some(session_history.session_id.clone());
+                        }
+
+                        // Persist updated record
+                        if let Err(e) = app.state_store.save_worker(&record) {
+                            eprintln!("Failed to persist session history: {}", e);
                         }
                     }
                 }

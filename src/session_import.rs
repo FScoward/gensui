@@ -3,7 +3,7 @@
 /// インタラクティブモード終了後にClaudeのセッションファイルから
 /// 履歴を読み取ってSessionHistoryに変換する
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,13 +85,12 @@ fn parse_session_file(file_path: &Path) -> Result<SessionHistory> {
     // 開始時刻を取得
     let started_at = session.get("created_at")
         .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
         .unwrap_or_else(|| {
             OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_else(|_| "unknown".to_string())
-                .as_str()
-        })
-        .to_string();
+        });
 
     // 終了時刻を取得
     let ended_at = session.get("updated_at")
