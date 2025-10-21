@@ -625,7 +625,7 @@ impl App {
         }
     }
 
-    fn get_log_max_scroll(&self) -> usize {
+    pub fn get_log_max_scroll(&self) -> usize {
         match self.log_view_mode {
             LogViewMode::Raw => self.log_messages.len().saturating_sub(1),
             _ => {

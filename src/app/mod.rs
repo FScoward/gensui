@@ -14,10 +14,12 @@ use crate::config::{Config, Workflow};
 use crate::state::{ActionLogEntry, StateStore};
 use crate::ui::{format_action_log, LogViewMode};
 use crate::worker::{
-    spawn_worker_system, WorkerEvent, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
+    spawn_worker_system, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
     WorkerStatus,
 };
 
+// Re-exported for use in App's public fields
+#[allow(unused_imports)]
 pub use types::{InteractiveRequest, PermissionPromptState};
 pub use worker_view::WorkerView;
 

@@ -184,19 +184,6 @@ impl App {
         }
     }
 
-    fn get_log_max_scroll(&self) -> usize {
-        match self.log_view_mode {
-            LogViewMode::Raw => self.log_messages.len().saturating_sub(1),
-            _ => {
-                if let Some(view) = self.selected_worker_view() {
-                    view.logs.len().saturating_sub(1)
-                } else {
-                    self.log_messages.len().saturating_sub(1)
-                }
-            }
-        }
-    }
-
     pub fn compact_logs(&mut self) {
         while self.log_messages.len() > 4 {
             self.log_messages.pop_front();
