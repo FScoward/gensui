@@ -96,10 +96,46 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             )?;
             terminal.clear()?;
 
+            // Add logs to notify the user
             app.push_log(format!(
                 "インタラクティブセッションから復帰しました ({})",
                 request.worker_name
             ));
+
+            // Find the worker and add log entries
+            if let Some(worker) = app.workers.iter_mut().find(|w| w.snapshot.name == request.worker_name) {
+                worker.push_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+                worker.push_log("🎯 Interactive Claude Code Session 完了".to_string());
+                worker.push_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+                worker.push_log("".to_string());
+                worker.push_log("インタラクティブセッションでの変更が完了しました。".to_string());
+                worker.push_log("".to_string());
+                worker.push_log("📋 セッション履歴を確認するには:".to_string());
+                worker.push_log("  1. このワーカーを選択".to_string());
+                worker.push_log("  2. 's' キーを押す".to_string());
+                worker.push_log("  3. セッション詳細を確認".to_string());
+                worker.push_log("".to_string());
+
+                // Check for file changes using git
+                if let Ok(output) = std::process::Command::new("git")
+                    .arg("status")
+                    .arg("--short")
+                    .current_dir(&request.worktree_path)
+                    .output()
+                {
+                    let changes = String::from_utf8_lossy(&output.stdout);
+                    if !changes.trim().is_empty() {
+                        worker.push_log("📝 変更されたファイル:".to_string());
+                        for line in changes.lines().take(10) {
+                            worker.push_log(format!("  {}", line));
+                        }
+                        if changes.lines().count() > 10 {
+                            worker.push_log(format!("  ... あと {} 件", changes.lines().count() - 10));
+                        }
+                        worker.push_log("".to_string());
+                    }
+                }
+            }
 
             continue;
         }
