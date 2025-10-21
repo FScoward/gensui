@@ -23,6 +23,8 @@ pub struct WorkerRecord {
     pub logs: Vec<String>,
     pub workflow: Workflow,
     pub completed_steps: usize,
+    #[serde(default)]
+    pub session_history: Vec<SessionHistory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,48 @@ pub struct ActionLogEntry {
     pub timestamp: String,
     pub message: String,
     pub worker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistory {
+    pub session_id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub prompt: String,
+    pub events: Vec<SessionEvent>,
+    pub total_tool_uses: usize,
+    pub files_modified: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SessionEvent {
+    ToolUse {
+        name: String,
+        timestamp: String,
+        input: Option<serde_json::Value>,
+    },
+    ToolResult {
+        name: String,
+        timestamp: String,
+        output: Option<String>,
+    },
+    AssistantMessage {
+        text: String,
+        timestamp: String,
+    },
+    ThinkingBlock {
+        content: String,
+        timestamp: String,
+    },
+    Result {
+        text: String,
+        is_error: bool,
+        timestamp: String,
+    },
+    Error {
+        message: String,
+        timestamp: String,
+    },
 }
 
 impl StateStore {
