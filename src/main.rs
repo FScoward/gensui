@@ -91,12 +91,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 
             // Try to import session history from Claude's session files
             println!("\nセッション履歴をインポート中...");
+            println!("  Project path: {}", request.worktree_path.display());
             match session_import::import_latest_session(&request.worktree_path, Some(session_start_time)) {
                 Ok(Some(session_history)) => {
                     println!("✓ セッション履歴をインポートしました");
                     println!("  Session ID: {}", session_history.session_id);
                     println!("  Tool uses: {}", session_history.total_tool_uses);
                     println!("  Files modified: {}", session_history.files_modified.len());
+                    println!("  Events: {}", session_history.events.len());
 
                     // Store the session history for later use
                     app.imported_session_history = Some((request.worker_name.clone(), session_history));
@@ -106,6 +108,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 }
                 Err(e) => {
                     println!("⚠ セッション履歴のインポートに失敗: {}", e);
+                    eprintln!("Debug error: {:?}", e);
                 }
             }
 
@@ -138,6 +141,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                         // Update session_id if available
                         if !session_history.session_id.is_empty() && session_history.session_id != "unknown" {
                             record.snapshot.session_id = Some(session_history.session_id.clone());
+
+                            // IMPORTANT: Also update the in-memory worker view's snapshot
+                            // so that next Shift+I will use the correct session_id
+                            if let Some(worker) = app.workers.iter_mut().find(|w| w.snapshot.name == worker_name) {
+                                worker.snapshot.session_id = Some(session_history.session_id.clone());
+                            }
                         }
 
                         // Persist updated record

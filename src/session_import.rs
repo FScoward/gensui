@@ -43,6 +43,7 @@ fn get_latest_session_file(sessions_dir: &Path, since: Option<OffsetDateTime>) -
     }
 
     let mut latest_file: Option<(PathBuf, std::time::SystemTime)> = None;
+    let mut file_count = 0;
 
     for entry in fs::read_dir(sessions_dir)? {
         let entry = entry?;
@@ -53,13 +54,20 @@ fn get_latest_session_file(sessions_dir: &Path, since: Option<OffsetDateTime>) -
             continue;
         }
 
+        file_count += 1;
+        eprintln!("Debug: Found .jsonl file: {}", path.display());
+
         // ファイルの更新時刻を取得
         if let Ok(metadata) = fs::metadata(&path) {
             if let Ok(modified) = metadata.modified() {
+                eprintln!("Debug:   Modified: {:?}", modified);
+
                 // since以降に更新されたファイルのみ
                 if let Some(since_time) = since {
                     let since_sys = std::time::SystemTime::from(since_time);
+                    eprintln!("Debug:   Since: {:?}", since_sys);
                     if modified <= since_sys {
+                        eprintln!("Debug:   Skipped (too old)");
                         continue;
                     }
                 }
@@ -76,6 +84,7 @@ fn get_latest_session_file(sessions_dir: &Path, since: Option<OffsetDateTime>) -
         }
     }
 
+    eprintln!("Debug: Total .jsonl files found: {}", file_count);
     Ok(latest_file.map(|(path, _)| path))
 }
 
@@ -255,10 +264,15 @@ pub fn import_latest_session(
 ) -> Result<Option<SessionHistory>> {
     let sessions_dir = get_claude_projects_dir(project_path)?;
 
+    eprintln!("Debug: Looking for sessions in: {}", sessions_dir.display());
+    eprintln!("Debug: Sessions dir exists: {}", sessions_dir.exists());
+
     if let Some(latest_file) = get_latest_session_file(&sessions_dir, since)? {
+        eprintln!("Debug: Found session file: {}", latest_file.display());
         let history = parse_session_file(&latest_file)?;
         Ok(Some(history))
     } else {
+        eprintln!("Debug: No session file found");
         Ok(None)
     }
 }
