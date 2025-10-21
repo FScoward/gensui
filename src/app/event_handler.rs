@@ -400,7 +400,7 @@ impl App {
                 } else if self.show_logs {
                     match self.log_view_mode {
                         LogViewMode::Overview => self.select_step_down(),
-                        LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_down();
+                        LogViewMode::Detail | LogViewMode::Raw => self.scroll_log_down(),
                     }
                 } else {
                     self.select_next();

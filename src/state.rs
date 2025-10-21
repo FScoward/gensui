@@ -130,6 +130,18 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn load_worker(&self, name: &str) -> Result<Option<WorkerRecord>> {
+        let path = self.worker_path(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = File::open(&path)
+            .with_context(|| format!("failed to open worker state {}", path.display()))?;
+        let record = serde_json::from_reader(file)
+            .with_context(|| format!("failed to parse worker state {}", path.display()))?;
+        Ok(Some(record))
+    }
+
     pub fn load_workers(&self) -> Result<Vec<WorkerRecord>> {
         let mut records = Vec::new();
         let dir = self.workers_dir();
