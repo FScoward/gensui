@@ -358,10 +358,12 @@ impl App {
 
                 let worktree_path = self.repo_root.join(&worker.snapshot.worktree);
                 let worker_name = worker.snapshot.name.clone();
+                let session_id = worker.snapshot.session_id.clone();
 
                 self.pending_interactive_mode = Some(InteractiveRequest {
                     worker_name,
                     worktree_path,
+                    session_id,
                 });
             }
         } else {

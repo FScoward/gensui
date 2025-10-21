@@ -73,4 +73,5 @@ pub struct PermissionTrackerEntry {
 pub struct InteractiveRequest {
     pub worker_name: String,
     pub worktree_path: PathBuf,
+    pub session_id: Option<String>,
 }

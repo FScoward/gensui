@@ -53,15 +53,26 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             println!("\n=== Interactive Claude Code Session ===");
             println!("Worker: {}", request.worker_name);
             println!("Worktree: {}", request.worktree_path.display());
+            if request.session_id.is_some() {
+                println!("Session: 継続（前回のセッションを引き継ぎます）");
+            } else {
+                println!("Session: 新規");
+            }
             println!("\nPress Enter to start Claude Code CLI...");
 
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
 
             // Launch Claude Code CLI (non-headless mode)
-            let status = Command::new("claude")
-                .current_dir(&request.worktree_path)
-                .status();
+            let mut cmd = Command::new("claude");
+            cmd.current_dir(&request.worktree_path);
+
+            // Add --continue flag if session exists
+            if request.session_id.is_some() {
+                cmd.arg("--continue");
+            }
+
+            let status = cmd.status();
 
             match status {
                 Ok(exit_status) => {
