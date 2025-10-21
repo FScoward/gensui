@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod log_parser;
+mod session_import;
 mod state;
 mod ui;
 mod worker;
@@ -14,6 +15,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use time::OffsetDateTime;
 
 use app::App;
 
@@ -63,6 +65,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
 
+            // Capture start time for session import
+            let session_start_time = OffsetDateTime::now_utc();
+
             // Launch Claude Code CLI (non-headless mode)
             let mut cmd = Command::new("claude");
             cmd.current_dir(&request.worktree_path);
@@ -84,6 +89,26 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 }
             }
 
+            // Try to import session history from Claude's session files
+            println!("\nセッション履歴をインポート中...");
+            match session_import::import_latest_session(Some(session_start_time)) {
+                Ok(Some(session_history)) => {
+                    println!("✓ セッション履歴をインポートしました");
+                    println!("  Session ID: {}", session_history.session_id);
+                    println!("  Tool uses: {}", session_history.total_tool_uses);
+                    println!("  Files modified: {}", session_history.files_modified.len());
+
+                    // Store the session history for later use
+                    app.imported_session_history = Some((request.worker_name.clone(), session_history));
+                }
+                Ok(None) => {
+                    println!("ℹ セッションファイルが見つかりませんでした");
+                }
+                Err(e) => {
+                    println!("⚠ セッション履歴のインポートに失敗: {}", e);
+                }
+            }
+
             println!("\nPress Enter to return to TUI...");
             input.clear();
             io::stdin().read_line(&mut input)?;
@@ -101,6 +126,30 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 "インタラクティブセッションから復帰しました ({})",
                 request.worker_name
             ));
+
+            // Process imported session history and persist it
+            if let Some((worker_name, session_history)) = app.imported_session_history.take() {
+                if worker_name == request.worker_name {
+                    // Load existing worker record
+                    if let Ok(Some(mut record)) = app.state_store.load_worker(&worker_name) {
+                        // Add the new session to history
+                        record.session_history.push(session_history.clone());
+
+                        // Persist updated record
+                        if let Err(e) = app.state_store.persist_worker(&record) {
+                            eprintln!("Failed to persist session history: {}", e);
+                        }
+
+                        // Update session_id if available
+                        if !session_history.session_id.is_empty() && session_history.session_id != "unknown" {
+                            record.session_id = Some(session_history.session_id.clone());
+                            if let Err(e) = app.state_store.persist_worker(&record) {
+                                eprintln!("Failed to persist session ID: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Find the worker and add log entries
             if let Some(worker) = app.workers.iter_mut().find(|w| w.snapshot.name == request.worker_name) {

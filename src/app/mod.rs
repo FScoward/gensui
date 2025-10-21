@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{Config, Workflow};
-use crate::state::{ActionLogEntry, StateStore};
+use crate::state::{ActionLogEntry, SessionHistory, StateStore};
 use crate::ui::{format_action_log, LogViewMode};
 use crate::worker::{
     spawn_worker_system, WorkerEventReceiver, WorkerHandle, WorkerId, WorkerSnapshot,
@@ -50,6 +50,7 @@ pub struct App {
     pub permission_prompt: Option<types::PermissionPromptState>,
     pub permission_tracker: HashMap<u64, types::PermissionTrackerEntry>,
     pub pending_interactive_mode: Option<types::InteractiveRequest>,
+    pub imported_session_history: Option<(String, SessionHistory)>,
     pub auto_scroll_logs: bool,
 }
 
@@ -116,6 +117,7 @@ impl App {
             permission_prompt: None,
             permission_tracker: HashMap::new(),
             pending_interactive_mode: None,
+            imported_session_history: None,
             auto_scroll_logs: true,
         })
     }
