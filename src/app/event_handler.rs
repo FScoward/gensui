@@ -562,6 +562,8 @@ impl App {
             match event {
                 WorkerEvent::Created(snapshot) => {
                     self.add_or_update_worker(snapshot.clone());
+                    // Reset status filter when creating a new worker to ensure it's visible
+                    self.status_filter = None;
                     self.push_log_with_worker(
                         Some(&snapshot.name),
                         format!(

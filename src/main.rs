@@ -18,6 +18,7 @@ use ratatui::Terminal;
 use time::OffsetDateTime;
 
 use app::App;
+use state::SessionHistory;
 
 fn main() -> Result<()> {
     enable_raw_mode()?;
@@ -131,8 +132,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             ));
 
             // Process imported session history and persist it
+            let mut imported_history: Option<SessionHistory> = None;
             if let Some((worker_name, session_history)) = app.imported_session_history.take() {
                 if worker_name == request.worker_name {
+                    // Keep a copy for adding to logs later
+                    imported_history = Some(session_history.clone());
+
                     // Load existing worker record
                     if let Ok(Some(mut record)) = app.state_store.load_worker(&worker_name) {
                         // Add the new session to history
@@ -159,6 +164,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
 
             // Find the worker and add log entries
             if let Some(worker) = app.workers.iter_mut().find(|w| w.snapshot.name == request.worker_name) {
+                // Convert SessionHistory to structured logs
+                if let Some(ref history) = imported_history {
+                    worker.add_session_history_logs(history);
+                }
+
                 worker.push_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
                 worker.push_log("🎯 Interactive Claude Code Session 完了".to_string());
                 worker.push_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
