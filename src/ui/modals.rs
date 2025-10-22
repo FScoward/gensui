@@ -67,7 +67,7 @@ pub fn render_prompt_modal(
 
     // Render header
     let header_lines = vec![
-        Line::raw("自由指示を入力してください (Ctrl+Enterで送信 / Escでキャンセル / Ctrl+Pでモード切替)"),
+        Line::raw("自由指示を入力してください (Enterで送信 / Ctrl+Jで改行 / Escでキャンセル / Ctrl+Pでモード切替)"),
     ];
     let header = Paragraph::new(header_lines)
         .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT).title("Free Prompt"));

@@ -203,8 +203,15 @@ impl App {
                         return false;
                     }
 
-                    // Handle Ctrl+Enter to submit
-                    if key_event.code == KeyCode::Enter && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    // Handle Ctrl+J to add newline
+                    if key_event.code == KeyCode::Char('j') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                        let input = key_event_to_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+                        textarea.input(input);
+                        return false;
+                    }
+
+                    // Handle Enter to submit (without modifiers)
+                    if key_event.code == KeyCode::Enter && key_event.modifiers.is_empty() {
                         let prompt = textarea.lines().join("\n");
                         let is_force_new = *force_new;
                         let mode = permission_mode.clone();

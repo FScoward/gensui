@@ -272,7 +272,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         Line::raw("q – 終了"),
         Line::raw(""),
         Line::raw("入力モーダル操作:"),
-        Line::raw("  プロンプト入力: Ctrl+Enter で送信 / Esc でキャンセル"),
+        Line::raw("  プロンプト入力: Enter で送信 / Ctrl+J で改行 / Esc でキャンセル"),
         Line::raw("  名前入力/変更: Enter で確定 / Esc でキャンセル"),
         Line::raw("  矢印キー/Home/End でカーソル移動、複数行入力可能"),
         Line::raw(""),
