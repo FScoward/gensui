@@ -1,3 +1,4 @@
+use tui_textarea::TextArea;
 use crate::ui::{permission_mode_label, LogViewMode};
 use crate::worker::{CreateWorkerRequest, WorkerId, WorkerStatus, list_existing_worktrees};
 
@@ -13,7 +14,7 @@ impl App {
             .map(|wf| wf.name.clone());
 
         self.input_mode = Some(InputMode::NameInput {
-            buffer: String::new(),
+            textarea: TextArea::default(),
             workflow_name,
             next_action: NameInputNextAction::CreateWithWorkflow,
         });
@@ -21,7 +22,7 @@ impl App {
 
     pub fn show_name_input_for_free_prompt(&mut self) {
         self.input_mode = Some(InputMode::NameInput {
-            buffer: String::new(),
+            textarea: TextArea::default(),
             workflow_name: None,
             next_action: NameInputNextAction::CreateWithFreePrompt,
         });
@@ -54,7 +55,7 @@ impl App {
     pub fn show_rename_modal(&mut self) {
         if let Some(id) = self.selected_worker_id() {
             self.input_mode = Some(InputMode::RenameWorker {
-                buffer: String::new(),
+                textarea: TextArea::default(),
                 worker_id: id,
             });
         } else {
@@ -336,7 +337,7 @@ impl App {
 
     pub fn start_free_prompt(&mut self) {
         self.input_mode = Some(InputMode::FreePrompt {
-            buffer: String::new(),
+            textarea: TextArea::default(),
             force_new: false,
             permission_mode: None,
             worker_name: None,

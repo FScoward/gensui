@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use tui_textarea::TextArea;
 use crate::worker::{ExistingWorktree, PermissionDecision, PermissionRequest, WorkerId};
 
 /// Input modes for the TUI
 pub enum InputMode {
     FreePrompt {
-        buffer: String,
+        textarea: TextArea<'static>,
         force_new: bool,
         permission_mode: Option<String>,
         worker_name: Option<String>,
@@ -26,12 +27,12 @@ pub enum InputMode {
         request_id: u64,                // permission request ID
     },
     NameInput {
-        buffer: String,
+        textarea: TextArea<'static>,
         workflow_name: Option<String>,
         next_action: NameInputNextAction,
     },
     RenameWorker {
-        buffer: String,
+        textarea: TextArea<'static>,
         worker_id: WorkerId,
     },
 }

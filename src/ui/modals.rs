@@ -35,14 +35,16 @@ pub fn render_modal(
 /// # Arguments
 /// * `frame` - 描画フレーム
 /// * `area` - 描画領域
-/// * `buffer` - 入力バッファ
+/// * `textarea` - テキストエリア
 /// * `permission_mode` - パーミッションモード
 pub fn render_prompt_modal(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    buffer: &str,
+    textarea: &tui_textarea::TextArea<'_>,
     permission_mode: &Option<String>,
 ) {
+    use ratatui::layout::{Constraint, Layout, Direction};
+
     let mode_str = permission_mode_label(permission_mode);
     let mode_color = match permission_mode.as_deref() {
         Some("plan") => Color::Cyan,
@@ -50,18 +52,37 @@ pub fn render_prompt_modal(
         _ => Color::Green,
     };
 
-    let lines = vec![
-        Line::raw(
-            "自由指示を入力してください (Enterで送信 / Escでキャンセル / Ctrl+Pでモード切替)",
-        ),
-        Line::raw(""),
-        Line::from(Span::styled(
-            buffer,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
+    // Split area into header, textarea, and footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Header
+            Constraint::Min(5),     // TextArea
+            Constraint::Length(3),  // Footer
+        ])
+        .split(area);
+
+    // Clear the background
+    frame.render_widget(Clear, area);
+
+    // Render header
+    let header_lines = vec![
+        Line::raw("自由指示を入力してください (Enterで送信 / Ctrl+Jで改行 / Escでキャンセル / Ctrl+Pでモード切替)"),
+    ];
+    let header = Paragraph::new(header_lines)
+        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT).title("Free Prompt"));
+    frame.render_widget(header, chunks[0]);
+
+    // Render TextArea in the middle
+    let textarea_block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .style(Style::default().fg(Color::Yellow));
+    let mut textarea_clone = textarea.clone();
+    textarea_clone.set_block(textarea_block);
+    frame.render_widget(&textarea_clone, chunks[1]);
+
+    // Render footer
+    let footer_lines = vec![
         Line::from(vec![
             Span::raw("モード: "),
             Span::styled(
@@ -71,11 +92,9 @@ pub fn render_prompt_modal(
         ]),
         Line::raw("Claude Codeがheadlessモードで実行されます"),
     ];
-    let widget = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("Free Prompt"));
-    frame.render_widget(Clear, area);
-    frame.render_widget(widget, area);
+    let footer = Paragraph::new(footer_lines)
+        .block(Block::default().borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT));
+    frame.render_widget(footer, chunks[2]);
 }
 
 /// パーミッション確認モーダルをレンダリング
@@ -317,15 +336,31 @@ pub fn render_worktree_selection_modal(
 pub fn render_name_input_modal(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    buffer: &str,
+    textarea: &tui_textarea::TextArea<'_>,
     workflow_name: &Option<String>,
 ) {
+    use ratatui::layout::{Constraint, Layout, Direction};
+
     let workflow_text = workflow_name
         .as_ref()
         .map(|name| format!("ワークフロー: {}", name))
         .unwrap_or_else(|| "新規ワーカー".to_string());
 
-    let lines = vec![
+    // Split area into header, textarea, and footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Header
+            Constraint::Length(3),  // TextArea
+            Constraint::Length(4),  // Footer
+        ])
+        .split(area);
+
+    // Clear the background
+    frame.render_widget(Clear, area);
+
+    // Render header
+    let header_lines = vec![
         Line::from(Span::styled(
             "Worker名を入力してください",
             Style::default()
@@ -334,46 +369,60 @@ pub fn render_name_input_modal(
         )),
         Line::raw(""),
         Line::raw(&workflow_text),
-        Line::raw(""),
-        Line::from(vec![
-            Span::raw("名前: "),
-            Span::styled(
-                buffer,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::raw(""),
+    ];
+    let header = Paragraph::new(header_lines)
+        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT).title("Worker Name"));
+    frame.render_widget(header, chunks[0]);
+
+    // Render TextArea in the middle
+    let textarea_block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .style(Style::default().fg(Color::Yellow));
+    let mut textarea_clone = textarea.clone();
+    textarea_clone.set_block(textarea_block);
+    frame.render_widget(&textarea_clone, chunks[1]);
+
+    // Render footer
+    let footer_lines = vec![
         Line::raw("Enter: 確定 / Esc: スキップ（デフォルト名を使用）"),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(
-                "※",
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled("※", Style::default().fg(Color::Gray)),
             Span::styled(
                 " 使用可能: 英数字、ハイフン、アンダースコア、日本語 (1-64文字)",
                 Style::default().fg(Color::Gray),
             ),
         ]),
     ];
-
-    let widget = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("Worker Name"));
-    frame.render_widget(Clear, area);
-    frame.render_widget(widget, area);
+    let footer = Paragraph::new(footer_lines)
+        .block(Block::default().borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT));
+    frame.render_widget(footer, chunks[2]);
 }
 
 /// Worker名前変更モーダルをレンダリング
 pub fn render_rename_worker_modal(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    buffer: &str,
+    textarea: &tui_textarea::TextArea<'_>,
     current_name: &str,
 ) {
-    let lines = vec![
+    use ratatui::layout::{Constraint, Layout, Direction};
+
+    // Split area into header, textarea, and footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Header
+            Constraint::Length(3),  // TextArea
+            Constraint::Length(4),  // Footer
+        ])
+        .split(area);
+
+    // Clear the background
+    frame.render_widget(Clear, area);
+
+    // Render header
+    let header_lines = vec![
         Line::from(Span::styled(
             "Worker名を変更",
             Style::default()
@@ -383,41 +432,36 @@ pub fn render_rename_worker_modal(
         Line::raw(""),
         Line::from(vec![
             Span::raw("現在の名前: "),
-            Span::styled(
-                current_name,
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(current_name, Style::default().fg(Color::Gray)),
         ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::raw("新しい名前: "),
-            Span::styled(
-                buffer,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::raw(""),
+    ];
+    let header = Paragraph::new(header_lines)
+        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT).title("Rename Worker"));
+    frame.render_widget(header, chunks[0]);
+
+    // Render TextArea in the middle
+    let textarea_block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .style(Style::default().fg(Color::Yellow));
+    let mut textarea_clone = textarea.clone();
+    textarea_clone.set_block(textarea_block);
+    frame.render_widget(&textarea_clone, chunks[1]);
+
+    // Render footer
+    let footer_lines = vec![
         Line::raw("Enter: 確定 / Esc: キャンセル"),
         Line::raw(""),
         Line::from(vec![
-            Span::styled(
-                "※",
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled("※", Style::default().fg(Color::Gray)),
             Span::styled(
                 " 使用可能: 英数字、ハイフン、アンダースコア、日本語 (1-64文字)",
                 Style::default().fg(Color::Gray),
             ),
         ]),
     ];
-
-    let widget = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("Rename Worker"));
-    frame.render_widget(Clear, area);
-    frame.render_widget(widget, area);
+    let footer = Paragraph::new(footer_lines)
+        .block(Block::default().borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT));
+    frame.render_widget(footer, chunks[2]);
 }
 
 /// 許可されたツールの説明テキストを生成

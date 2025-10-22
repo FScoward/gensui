@@ -1,12 +1,110 @@
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tui_textarea::Input;
 
 use crate::ui::{permission_mode_label, describe_allowed_tools, AVAILABLE_TOOLS, LogViewMode};
 use crate::worker::{PermissionDecision, PermissionRequest, WorkerId, WorkerEvent, WorkerStatus};
 
 use super::types::{InputMode, NameInputNextAction};
 use super::App;
+
+/// Convert crossterm KeyEvent to ratatui's crossterm KeyEvent for tui-textarea
+fn key_event_to_input(key_event: KeyEvent) -> Input {
+    // Convert crossterm KeyEvent to ratatui::crossterm::event::KeyEvent
+    // They have the same structure, so we can recreate it
+    let ratatui_key_event = ratatui::crossterm::event::KeyEvent::new(
+        match key_event.code {
+            KeyCode::Backspace => ratatui::crossterm::event::KeyCode::Backspace,
+            KeyCode::Enter => ratatui::crossterm::event::KeyCode::Enter,
+            KeyCode::Left => ratatui::crossterm::event::KeyCode::Left,
+            KeyCode::Right => ratatui::crossterm::event::KeyCode::Right,
+            KeyCode::Up => ratatui::crossterm::event::KeyCode::Up,
+            KeyCode::Down => ratatui::crossterm::event::KeyCode::Down,
+            KeyCode::Home => ratatui::crossterm::event::KeyCode::Home,
+            KeyCode::End => ratatui::crossterm::event::KeyCode::End,
+            KeyCode::PageUp => ratatui::crossterm::event::KeyCode::PageUp,
+            KeyCode::PageDown => ratatui::crossterm::event::KeyCode::PageDown,
+            KeyCode::Tab => ratatui::crossterm::event::KeyCode::Tab,
+            KeyCode::BackTab => ratatui::crossterm::event::KeyCode::BackTab,
+            KeyCode::Delete => ratatui::crossterm::event::KeyCode::Delete,
+            KeyCode::Insert => ratatui::crossterm::event::KeyCode::Insert,
+            KeyCode::F(n) => ratatui::crossterm::event::KeyCode::F(n),
+            KeyCode::Char(c) => ratatui::crossterm::event::KeyCode::Char(c),
+            KeyCode::Null => ratatui::crossterm::event::KeyCode::Null,
+            KeyCode::Esc => ratatui::crossterm::event::KeyCode::Esc,
+            KeyCode::CapsLock => ratatui::crossterm::event::KeyCode::CapsLock,
+            KeyCode::ScrollLock => ratatui::crossterm::event::KeyCode::ScrollLock,
+            KeyCode::NumLock => ratatui::crossterm::event::KeyCode::NumLock,
+            KeyCode::PrintScreen => ratatui::crossterm::event::KeyCode::PrintScreen,
+            KeyCode::Pause => ratatui::crossterm::event::KeyCode::Pause,
+            KeyCode::Menu => ratatui::crossterm::event::KeyCode::Menu,
+            KeyCode::KeypadBegin => ratatui::crossterm::event::KeyCode::KeypadBegin,
+            KeyCode::Media(m) => {
+                use crossterm::event::MediaKeyCode;
+                match m {
+                    MediaKeyCode::Play => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::Play),
+                    MediaKeyCode::Pause => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::Pause),
+                    MediaKeyCode::PlayPause => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::PlayPause),
+                    MediaKeyCode::Reverse => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::Reverse),
+                    MediaKeyCode::Stop => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::Stop),
+                    MediaKeyCode::FastForward => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::FastForward),
+                    MediaKeyCode::Rewind => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::Rewind),
+                    MediaKeyCode::TrackNext => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::TrackNext),
+                    MediaKeyCode::TrackPrevious => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::TrackPrevious),
+                    MediaKeyCode::Record => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::Record),
+                    MediaKeyCode::LowerVolume => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::LowerVolume),
+                    MediaKeyCode::RaiseVolume => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::RaiseVolume),
+                    MediaKeyCode::MuteVolume => ratatui::crossterm::event::KeyCode::Media(ratatui::crossterm::event::MediaKeyCode::MuteVolume),
+                }
+            },
+            KeyCode::Modifier(m) => {
+                use crossterm::event::ModifierKeyCode;
+                match m {
+                    ModifierKeyCode::LeftShift => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::LeftShift),
+                    ModifierKeyCode::LeftControl => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::LeftControl),
+                    ModifierKeyCode::LeftAlt => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::LeftAlt),
+                    ModifierKeyCode::LeftSuper => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::LeftSuper),
+                    ModifierKeyCode::LeftHyper => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::LeftHyper),
+                    ModifierKeyCode::LeftMeta => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::LeftMeta),
+                    ModifierKeyCode::RightShift => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::RightShift),
+                    ModifierKeyCode::RightControl => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::RightControl),
+                    ModifierKeyCode::RightAlt => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::RightAlt),
+                    ModifierKeyCode::RightSuper => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::RightSuper),
+                    ModifierKeyCode::RightHyper => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::RightHyper),
+                    ModifierKeyCode::RightMeta => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::RightMeta),
+                    ModifierKeyCode::IsoLevel3Shift => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::IsoLevel3Shift),
+                    ModifierKeyCode::IsoLevel5Shift => ratatui::crossterm::event::KeyCode::Modifier(ratatui::crossterm::event::ModifierKeyCode::IsoLevel5Shift),
+                }
+            },
+        },
+        convert_modifiers(key_event.modifiers),
+    );
+    Input::from(ratatui_key_event)
+}
+
+fn convert_modifiers(modifiers: KeyModifiers) -> ratatui::crossterm::event::KeyModifiers {
+    let mut result = ratatui::crossterm::event::KeyModifiers::empty();
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        result.insert(ratatui::crossterm::event::KeyModifiers::SHIFT);
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        result.insert(ratatui::crossterm::event::KeyModifiers::CONTROL);
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        result.insert(ratatui::crossterm::event::KeyModifiers::ALT);
+    }
+    if modifiers.contains(KeyModifiers::SUPER) {
+        result.insert(ratatui::crossterm::event::KeyModifiers::SUPER);
+    }
+    if modifiers.contains(KeyModifiers::HYPER) {
+        result.insert(ratatui::crossterm::event::KeyModifiers::HYPER);
+    }
+    if modifiers.contains(KeyModifiers::META) {
+        result.insert(ratatui::crossterm::event::KeyModifiers::META);
+    }
+    result
+}
 
 impl App {
     /// Handle keyboard input
@@ -83,49 +181,53 @@ impl App {
         if let Some(mode) = self.input_mode.as_mut() {
             match mode {
                 InputMode::FreePrompt {
-                    buffer,
+                    textarea,
                     force_new,
                     permission_mode,
                     worker_name,
-                } => match key_event.code {
-                    KeyCode::Esc => {
-                        self.input_mode = None;
-                    }
-                    KeyCode::Enter => {
-                        let prompt = buffer.trim().to_string();
-                        let is_force_new = *force_new;
-                        let mode = permission_mode.clone();
-                        let name = worker_name.clone();
-                        self.input_mode = None;
-                        if !prompt.is_empty() {
-                            self.submit_free_prompt(prompt, is_force_new, mode, name);
-                        } else {
-                            self.push_log("空の指示は送信されませんでした".into());
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    KeyCode::Tab => {
-                        buffer.push('\t');
-                    }
-                    KeyCode::Char('p') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Cycle through: None -> "plan" -> "acceptEdits" -> None
+                } => {
+                    // Handle Ctrl+P for permission mode cycling
+                    if key_event.code == KeyCode::Char('p') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
                         *permission_mode = match permission_mode.as_deref() {
                             None => Some("plan".to_string()),
                             Some("plan") => Some("acceptEdits".to_string()),
                             Some("acceptEdits") => None,
                             _ => None,
                         };
+                        return false;
                     }
-                    KeyCode::Char(c) => {
-                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key_event.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            buffer.push(c);
+
+                    // Handle Esc to cancel
+                    if key_event.code == KeyCode::Esc {
+                        self.input_mode = None;
+                        return false;
+                    }
+
+                    // Handle Ctrl+J to add newline
+                    if key_event.code == KeyCode::Char('j') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                        let input = key_event_to_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+                        textarea.input(input);
+                        return false;
+                    }
+
+                    // Handle Enter to submit (without modifiers)
+                    if key_event.code == KeyCode::Enter && key_event.modifiers.is_empty() {
+                        let prompt = textarea.lines().join("\n");
+                        let is_force_new = *force_new;
+                        let mode = permission_mode.clone();
+                        let name = worker_name.clone();
+                        self.input_mode = None;
+                        if !prompt.trim().is_empty() {
+                            self.submit_free_prompt(prompt, is_force_new, mode, name);
+                        } else {
+                            self.push_log("空の指示は送信されませんでした".into());
                         }
+                        return false;
                     }
-                    _ => {}
+
+                    // Pass all other keys to TextArea
+                    let input = key_event_to_input(key_event);
+                    textarea.input(input);
                 },
                 InputMode::CreateWorkerSelection { selected } => match key_event.code {
                     KeyCode::Esc => {
@@ -253,9 +355,9 @@ impl App {
                         _ => {}
                     }
                 }
-                InputMode::NameInput { buffer, workflow_name, next_action } => match key_event.code {
-                    KeyCode::Esc => {
-                        // Cancel and use default name
+                InputMode::NameInput { textarea, workflow_name, next_action } => {
+                    // Handle Esc to cancel and use default name
+                    if key_event.code == KeyCode::Esc {
                         let workflow = workflow_name.clone();
                         let action = next_action.clone();
                         self.input_mode = None;
@@ -267,16 +369,19 @@ impl App {
                             NameInputNextAction::CreateWithFreePrompt => {
                                 // Show free prompt modal with default name
                                 self.input_mode = Some(InputMode::FreePrompt {
-                                    buffer: String::new(),
+                                    textarea: tui_textarea::TextArea::default(),
                                     force_new: true,
                                     permission_mode: None,
                                     worker_name: None,
                                 });
                             }
                         }
+                        return false;
                     }
-                    KeyCode::Enter => {
-                        let name = buffer.trim().to_string();
+
+                    // Handle Enter to submit
+                    if key_event.code == KeyCode::Enter {
+                        let name = textarea.lines().join("").trim().to_string();
                         let workflow = workflow_name.clone();
                         let action = next_action.clone();
                         self.input_mode = None;
@@ -295,32 +400,30 @@ impl App {
                                 // Show free prompt modal
                                 let worker_name = if name.is_empty() { None } else { Some(name) };
                                 self.input_mode = Some(InputMode::FreePrompt {
-                                    buffer: String::new(),
+                                    textarea: tui_textarea::TextArea::default(),
                                     force_new: true,
                                     permission_mode: None,
                                     worker_name,
                                 });
                             }
                         }
+                        return false;
                     }
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key_event.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            buffer.push(c);
-                        }
-                    }
-                    _ => {}
+
+                    // Pass all other keys to TextArea
+                    let input = key_event_to_input(key_event);
+                    textarea.input(input);
                 },
-                InputMode::RenameWorker { buffer, worker_id } => match key_event.code {
-                    KeyCode::Esc => {
+                InputMode::RenameWorker { textarea, worker_id } => {
+                    // Handle Esc to cancel
+                    if key_event.code == KeyCode::Esc {
                         self.input_mode = None;
+                        return false;
                     }
-                    KeyCode::Enter => {
-                        let new_name = buffer.trim().to_string();
+
+                    // Handle Enter to submit
+                    if key_event.code == KeyCode::Enter {
+                        let new_name = textarea.lines().join("").trim().to_string();
                         let wid = *worker_id;
                         self.input_mode = None;
                         if !new_name.is_empty() {
@@ -328,18 +431,12 @@ impl App {
                         } else {
                             self.push_log("空の名前は無効です".into());
                         }
+                        return false;
                     }
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        if !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key_event.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            buffer.push(c);
-                        }
-                    }
-                    _ => {}
+
+                    // Pass all other keys to TextArea
+                    let input = key_event_to_input(key_event);
+                    textarea.input(input);
                 },
             }
             return false;

@@ -50,11 +50,11 @@ impl App {
         if let Some(input_mode) = &self.input_mode {
             match input_mode {
                 InputMode::FreePrompt {
-                    buffer,
+                    textarea,
                     permission_mode,
                     ..
                 } => {
-                    self.render_prompt_modal(frame, buffer, permission_mode);
+                    self.render_prompt_modal(frame, textarea, permission_mode);
                 }
                 InputMode::CreateWorkerSelection { selected } => {
                     self.render_create_selection_modal(frame, *selected);
@@ -73,12 +73,12 @@ impl App {
                 } => {
                     self.render_tool_selection_modal(frame, tools, *selected_idx, permission_mode);
                 }
-                InputMode::NameInput { buffer, workflow_name, .. } => {
-                    self.render_name_input_modal(frame, buffer, workflow_name);
+                InputMode::NameInput { textarea, workflow_name, .. } => {
+                    self.render_name_input_modal(frame, textarea, workflow_name);
                 }
-                InputMode::RenameWorker { buffer, worker_id } => {
+                InputMode::RenameWorker { textarea, worker_id } => {
                     if let Some(worker) = self.workers.iter().find(|w| w.snapshot.id == *worker_id) {
-                        self.render_rename_worker_modal(frame, buffer, &worker.snapshot.name);
+                        self.render_rename_worker_modal(frame, textarea, &worker.snapshot.name);
                     }
                 }
             }
@@ -136,11 +136,11 @@ impl App {
     fn render_prompt_modal(
         &self,
         frame: &mut ratatui::Frame<'_>,
-        buffer: &str,
+        textarea: &tui_textarea::TextArea<'_>,
         permission_mode: &Option<String>,
     ) {
-        let area = centered_rect(70, 30, frame.area());
-        render_prompt_modal(frame, area, buffer, permission_mode);
+        let area = centered_rect(70, 50, frame.area());
+        render_prompt_modal(frame, area, textarea, permission_mode);
     }
 
     fn render_permission_modal(
@@ -188,21 +188,21 @@ impl App {
     fn render_name_input_modal(
         &self,
         frame: &mut ratatui::Frame<'_>,
-        buffer: &str,
+        textarea: &tui_textarea::TextArea<'_>,
         workflow_name: &Option<String>,
     ) {
         let area = centered_rect(60, 40, frame.area());
-        render_name_input_modal(frame, area, buffer, workflow_name);
+        render_name_input_modal(frame, area, textarea, workflow_name);
     }
 
     fn render_rename_worker_modal(
         &self,
         frame: &mut ratatui::Frame<'_>,
-        buffer: &str,
+        textarea: &tui_textarea::TextArea<'_>,
         current_name: &str,
     ) {
         let area = centered_rect(60, 40, frame.area());
-        render_rename_worker_modal(frame, area, buffer, current_name);
+        render_rename_worker_modal(frame, area, textarea, current_name);
     }
 
     pub fn help_lines(&self) -> Vec<Line<'static>> {
