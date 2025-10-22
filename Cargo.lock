@@ -292,6 +292,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "time",
+ "tui-textarea",
 ]
 
 [[package]]
@@ -752,6 +753,17 @@ checksum = "30cfb0125f12d9c277f35663a0a33f8c30190f4e4574868a330595412d34ebf3"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tui-textarea"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29c07084342a575cea919eea996b9658a358c800b03d435df581c1d7c60e065a"
+dependencies = [
+ "crossterm 0.28.1",
+ "ratatui",
+ "unicode-width",
 ]
 
 [[package]]
