@@ -96,8 +96,6 @@ fn parse_session_file(file_path: &Path) -> Result<SessionHistory> {
     let reader = BufReader::new(file);
 
     let mut session_id = String::from("unknown");
-    let mut started_at = String::new();
-    let mut ended_at: Option<String> = None;
     let mut events = Vec::new();
     let mut prompt = String::new();
     let mut total_tool_uses = 0;
@@ -236,12 +234,12 @@ fn parse_session_file(file_path: &Path) -> Result<SessionHistory> {
     }
 
     // 開始・終了時刻を設定
-    started_at = first_timestamp.unwrap_or_else(|| {
+    let started_at = first_timestamp.unwrap_or_else(|| {
         OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string())
     });
-    ended_at = last_timestamp;
+    let ended_at = last_timestamp;
 
     Ok(SessionHistory {
         session_id,
