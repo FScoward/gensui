@@ -7,7 +7,7 @@ use name_registry::NameRegistry;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +15,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::config::{ClaudeStep, Config, Workflow, WorkflowStep};
 use crate::state::{ManagerState, SessionEvent, SessionHistory, StateStore};
@@ -1524,7 +1526,24 @@ where
             "claude".to_string()
         }
     });
-    let mut cmd = Command::new(&binary);
+
+    // Initialize PTY system
+    let pty_system = native_pty_system();
+    let pty_size = PtySize {
+        rows: 24,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let pty_pair = pty_system.openpty(pty_size)
+        .with_context(|| "failed to open PTY")?;
+
+    // Build command using CommandBuilder
+    let mut cmd = CommandBuilder::new(&binary);
+    cmd.cwd(dir);
+
+    // Set environment variables
+    cmd.env("TERM", "xterm-256color");
 
     // Only set custom CLAUDE_CONFIG_DIR if GENSUI_CLAUDE_HOME is explicitly set
     // Otherwise, use the user's default Claude configuration (including API keys)
@@ -1536,21 +1555,23 @@ where
                 claude_home.display()
             )
         })?;
-        cmd.env("CLAUDE_CONFIG_DIR", &claude_home);
+        cmd.env("CLAUDE_CONFIG_DIR", claude_home.to_string_lossy().to_string());
     }
-    // Otherwise, don't set HOME or CLAUDE_CONFIG_DIR - use user's default settings
 
-    cmd.arg("--print").arg(prompt);
-    cmd.arg("--output-format").arg("stream-json");
-    cmd.arg("--verbose");
+    // Build arguments
+    let mut args = vec!["--print".to_string(), prompt.to_string()];
+    args.push("--output-format".to_string());
+    args.push("stream-json".to_string());
+    args.push("--verbose".to_string());
 
     // Continue existing session if session_id is provided
     if session_id.is_some() {
-        cmd.arg("--continue");
+        args.push("--continue".to_string());
     }
 
     if let Some(model) = &step.model {
-        cmd.arg("--model").arg(model);
+        args.push("--model".to_string());
+        args.push(model.clone());
     }
 
     // If permission_mode is not set, use bypassPermissions by default
@@ -1559,11 +1580,13 @@ where
         .permission_mode
         .as_deref()
         .unwrap_or("bypassPermissions");
-    cmd.arg("--permission-mode").arg(effective_mode);
+    args.push("--permission-mode".to_string());
+    args.push(effective_mode.to_string());
 
     if let Some(tools) = &step.allowed_tools {
         if !tools.is_empty() {
-            cmd.arg("--allowedTools").arg(tools.join(","));
+            args.push("--allowedTools".to_string());
+            args.push(tools.join(","));
         }
     }
 
@@ -1572,7 +1595,7 @@ where
             let replaced = arg
                 .replace("{{prompt}}", prompt)
                 .replace("{{workdir}}", &dir.to_string_lossy());
-            cmd.arg(replaced);
+            args.push(replaced);
         }
     }
 
@@ -1583,51 +1606,58 @@ where
     // on the CLI arguments (sandboxing is configured through settings file)
     let _sandbox_enabled = step.sandbox_mode.unwrap_or(default_sandbox_mode);
 
-    cmd.current_dir(dir);
+    cmd.args(args);
 
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| "failed to spawn Claude Code process")?;
+    // Spawn command through PTY
+    let mut child = pty_pair.slave.spawn_command(cmd)
+        .with_context(|| "failed to spawn Claude Code process in PTY")?;
 
     let mut extracted_session_id: Option<String> = None;
-    let mut stderr_lines = Vec::new();
     let mut session_events: Vec<SessionEvent> = Vec::new();
     let mut total_tool_uses = 0;
     let mut files_modified: Vec<String> = Vec::new();
 
-    // Capture stderr in a separate thread
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            let mut lines = Vec::new();
-            for line in reader.lines().flatten() {
-                lines.push(line);
+    // Read from PTY master in a separate thread
+    let mut reader = pty_pair.master.try_clone_reader()
+        .with_context(|| "failed to clone PTY reader")?;
+
+    let reader_thread = thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let mut read_buf = [0u8; 8192];
+
+        loop {
+            match reader.read(&mut read_buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    buffer.extend_from_slice(&read_buf[..n]);
+                }
+                Err(_) => break,
             }
-            lines
-        })
+        }
+
+        buffer
     });
 
-    // Stream stdout in real-time with small buffer for responsiveness
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::with_capacity(256, stdout);
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    log_fn(format!("Error reading stdout: {}", e));
-                    continue;
-                }
-            };
+    // Process the output after child completes
+    let exit_status = child.wait()
+        .with_context(|| "failed to wait for Claude Code process")?;
 
-            if line.trim().is_empty() {
-                continue;
-            }
+    // Get all output from the reader thread
+    let output_bytes = reader_thread.join()
+        .map_err(|_| anyhow!("PTY reader thread panicked"))?;
 
-            // Try to parse as JSON
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+    let output = String::from_utf8_lossy(&output_bytes);
+
+    // Process output line by line
+    for line in output.lines() {
+        let line = line.trim_end();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Try to parse as JSON
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                 let event_time = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_else(|_| "unknown".to_string());
 
@@ -1754,42 +1784,17 @@ where
                         // log_fn(format!("🔍 JSON: {}", line));
                     }
                 }
-            } else {
-                // Non-JSON output
-                log_fn(line);
-            }
-        }
-    }
-
-    // Wait for process to complete
-    let status = child.wait().with_context(|| "failed to wait for Claude Code process")?;
-
-    // Collect stderr from thread
-    if let Some(handle) = stderr_handle {
-        if let Ok(lines) = handle.join() {
-            stderr_lines = lines;
-        }
-    }
-
-    // Log stderr output
-    if !stderr_lines.is_empty() {
-        log_fn("─── stderr ───".to_string());
-        for line in &stderr_lines {
-            if !line.trim().is_empty() {
-                log_fn(line.clone());
-            }
+        } else {
+            // Non-JSON output
+            log_fn(line.to_string());
         }
     }
 
     let end_time = OffsetDateTime::now_utc();
 
-    if !status.success() {
-        let mut error_msg = format!("Claude CLI exited with status {}", status);
-        if !stderr_lines.is_empty() {
-            error_msg.push_str("\nstderr:\n");
-            error_msg.push_str(&stderr_lines.join("\n"));
-        }
-        return Err(anyhow!("{}", error_msg));
+    let exit_code = exit_status.exit_code();
+    if exit_code != 0 {
+        return Err(anyhow!("Claude CLI exited with status {}", exit_code));
     }
 
     // Build session history
